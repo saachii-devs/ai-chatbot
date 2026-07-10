@@ -12,7 +12,7 @@ export default function HomeView() {
   return (
     <div className="pointer-events-none absolute inset-x-0 z-10 px-4" style={POSITION}>
       <h1 className="font-display text-center text-4xl text-neutral-200 md:text-5xl">
-        <span className="font-sans">How can I assist you</span> today?
+        <span className="font-sans">How can I assist you today?</span>, Buddy?
        </h1>
     </div>
   )
