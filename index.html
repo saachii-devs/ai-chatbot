@@ -5,10 +5,16 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <!-- viewport-fit=cover is what makes env(safe-area-inset-*) report a real
          value; without it the insets are always 0 and the composer sits under
-         the home bar on a notched phone. -->
+         the home bar on a notched phone.
+         interactive-widget=resizes-content shrinks the LAYOUT viewport (h-dvh,
+         and thus every % height) when the on-screen keyboard opens, instead of
+         the default resizes-visual which paints the keyboard over a full-height
+         page. This keeps the centred home composer inside the visible area
+         (default would lift it off the top) and drives --kb-inset to ~0 so the
+         box no longer jitters as visualViewport.offsetTop oscillates on scroll. -->
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
     />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />

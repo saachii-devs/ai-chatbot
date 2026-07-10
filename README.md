@@ -1,7 +1,6 @@
 # AI Assistant
 
-An AI chat app you can also talk to. React + TypeScript + Vite, Tailwind,
-no backend — chats live in `localStorage`.
+An AI chat app you can also talk to. React + TypeScript + Vite, Tailwind
 
 ## Setup
 
