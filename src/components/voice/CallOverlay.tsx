@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTypewriter } from '../../hooks/useTypewriter'
 import { useVoiceCall } from '../../hooks/useVoiceCall'
 import { useCall } from '../../state/CallContext'
@@ -72,6 +72,14 @@ export default function CallOverlay() {
   const idle = !userText && !assistantText && !error
   const isDisconnected = status === 'disconnected'
 
+  // Keep the newest streaming line pinned to the bottom as it grows. mt-auto lets the top
+  // scroll into view, but an overflowing container won't follow growing content on its own.
+  const scrollRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const el = scrollRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [userShown, assistantShown])
+
   // The user line, receded: hierarchy between the two is carried by colour, not weight.
   const userLine = userText ? (
     <p className="break-words text-2xl font-light leading-snug text-neutral-500 sm:text-3xl">
@@ -109,34 +117,40 @@ export default function CallOverlay() {
           )}
         </div>
 
-        {/* The exchange, anchored to the bottom so a growing reply pushes the question up. */}
+        {/* The exchange, anchored to the bottom so a growing reply pushes the question up.
+            mt-auto (not justify-end on the scroller) keeps short content at the bottom while
+            still letting the top line scroll into view once the pair overflows — justify-end
+            would clip the top and make it unreachable. */}
         <div
+          ref={scrollRef}
           aria-live="polite"
-          className="flex flex-1 flex-col justify-end gap-4 overflow-y-auto px-2 py-8 text-center"
+          className="flex flex-1 flex-col overflow-y-auto px-2 py-8 text-center"
         >
-          {idle && (
-            <p className="text-center text-sm text-neutral-500">
-              {status === 'connecting'
-                ? 'Connecting…'
-                : 'Say something — the conversation will appear here.'}
-            </p>
-          )}
+          <div className="mt-auto flex flex-col gap-4">
+            {idle && (
+              <p className="text-center text-sm text-neutral-500">
+                {status === 'connecting'
+                  ? 'Connecting…'
+                  : 'Say something — the conversation will appear here.'}
+              </p>
+            )}
 
-          {/* Chronological in the DOM, not just on screen: this is an aria-live region, so
-              a CSS-only reorder would announce the exchange backwards. */}
-          {userIsNewer ? (
-            <>
-              {assistantLine}
-              {userLine}
-            </>
-          ) : (
-            <>
-              {userLine}
-              {assistantLine}
-            </>
-          )}
+            {/* Chronological in the DOM, not just on screen: this is an aria-live region, so
+                a CSS-only reorder would announce the exchange backwards. */}
+            {userIsNewer ? (
+              <>
+                {assistantLine}
+                {userLine}
+              </>
+            ) : (
+              <>
+                {userLine}
+                {assistantLine}
+              </>
+            )}
 
-          {error && <p className="text-sm text-red-400">{error}</p>}
+            {error && <p className="text-sm text-red-400">{error}</p>}
+          </div>
         </div>
 
         <Visualizer
