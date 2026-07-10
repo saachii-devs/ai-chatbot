@@ -1,0 +1,200 @@
+@import "tailwindcss";
+
+@theme {
+  /* Google Sans Flex everywhere; Geist Pixel only for the hero greeting */
+  --font-sans: "Google Sans Flex", "Google Sans", system-ui, sans-serif;
+  --font-display: "Geist Pixel", monospace;
+
+  /* Only for the no-WebGL bloom fallback; the fluid shader owns the real one. */
+  --animate-glow-breathe: glow-breathe 5s ease-in-out infinite alternate;
+
+  @keyframes glow-breathe {
+    from {
+      opacity: 0.18;
+    }
+    to {
+      opacity: 0.32;
+    }
+  }
+
+  /* `rise-in` for content arriving in place; `scale-in` for things over the page. */
+  --animate-fade-in: fade-in 200ms ease-out;
+  --animate-rise-in: rise-in 280ms cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-scale-in: scale-in 200ms cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* `steps(1)` snaps on and off like a terminal cursor rather than pulsing. */
+  --animate-caret-blink: caret-blink 1s steps(1) infinite;
+
+  @keyframes caret-blink {
+    0%,
+    50% {
+      opacity: 1;
+    }
+    50.01%,
+    100% {
+      opacity: 0;
+    }
+  }
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+    }
+  }
+  @keyframes rise-in {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+  }
+  @keyframes scale-in {
+    from {
+      opacity: 0;
+      transform: scale(0.96);
+    }
+  }
+}
+
+/* 0 = new chat, 1 = ongoing chat. Written to :root each frame by FluidContext's
+   spring. Typed <number> so calc() can multiply by it; it exceeds 1 mid-transition
+   (the spring overshoots), so every consumer must tolerate that.
+   `--settle-inv` is published separately: a calc() nested inside a multiplication
+   has patchy browser support. */
+@property --settle {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
+}
+
+@property --settle-inv {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 1;
+}
+
+/* Published by <Composer/> via ResizeObserver: the message list and the
+   greeting both position themselves off the composer's live height. */
+@property --composer-h {
+  syntax: "<length>";
+  inherits: true;
+  initial-value: 0px;
+}
+
+/* How much viewport the on-screen keyboard covers. Zero where visualViewport
+   does not exist. */
+@property --kb-inset {
+  syntax: "<length>";
+  inherits: true;
+  initial-value: 0px;
+}
+
+:root {
+  /* Native widgets — scrollbars, text selection, form controls — follow suit */
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background-color: var(--color-neutral-950);
+}
+
+@layer components {
+  /* Padding interpolated off `--settle` so the box tightens continuously as it
+     sinks, rather than snapping when the view flips. */
+  .composer-pad {
+    padding-left: calc(0.75rem + 0.25rem * var(--settle-inv));
+    padding-right: calc(0.75rem + 0.25rem * var(--settle-inv));
+    padding-top: calc(0.75rem + 0.5rem * var(--settle-inv));
+    padding-bottom: calc(0.625rem + 0.375rem * var(--settle-inv));
+  }
+
+  @media (width >= 40rem) {
+    .composer-pad {
+      padding-top: calc(0.625rem + 0.25rem * var(--settle-inv));
+      padding-bottom: calc(0.625rem + 0.25rem * var(--settle-inv));
+    }
+  }
+
+  /* The composer's idle/focus border. An `outline`, not an SVG stroke: the
+     browser rasterises all four sides from one width (a hand-placed 1.5px stroke
+     is 2.25 device px at 150% scaling and comes out lopsided), it follows
+     border-radius on its own, and it takes up no space so nothing reflows.
+     `:focus-within`, not `:focus` — focus lands on the textarea inside. */
+  .composer-ring {
+    outline: 1.5px solid #0b2a6b;
+    outline-offset: 0;
+    transition: outline-color 300ms ease-out;
+  }
+
+  .composer-ring:focus-within {
+    outline-color: #2f6feb;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .composer-ring {
+      transition: none;
+    }
+  }
+}
+
+@layer base {
+  /* Tailwind v4 dropped the UA `cursor: pointer` on <button>. Hand it back once. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  summary {
+    cursor: pointer;
+  }
+
+  /* One keyboard focus ring for everything focusable. `:where()` contributes zero
+     specificity, so call sites override it without an `!important` arms race.
+     Text fields still need their own `focus-visible:outline-*` utilities: the
+     `outline-none` that kills their always-on ring sits in a later layer. */
+  :where(a, button, input, textarea, select, summary, [tabindex]:not([tabindex="-1"])):focus-visible {
+    outline: 2px solid var(--color-blue-500);
+    outline-offset: 2px;
+  }
+
+  /* Chromium/Safari read the ::-webkit-* rules, Firefox reads `scrollbar-*`.
+     Neither understands the other's, so both blocks are needed. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-neutral-700) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  /* Kills the stepper arrows and the corner where the two bars meet. */
+  ::-webkit-scrollbar-button,
+  ::-webkit-scrollbar-corner {
+    display: none;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--color-neutral-700);
+    border-radius: 9999px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--color-blue-600);
+  }
+}
+
+/* One global opt-out beats sprinkling `motion-safe:` on every animated node. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
