@@ -1,13 +1,7 @@
 # AI Assistant
 
-A ChatGPT-style chat app you can also talk to. React + TypeScript + Vite, Tailwind,
+An AI chat app you can also talk to. React + TypeScript + Vite, Tailwind,
 no backend — chats live in `localStorage`.
-
-- Streaming replies, stop/retry, multiple conversations, search, cross-tab sync
-- Voice calls: live transcript, spoken replies, barge-in. Hang up and the chat keeps
-  a one-line marker you can unfold into the transcript
-- Chat works with any OpenAI-compatible provider; voice with ElevenLabs or the
-  browser's built-in Web Speech API. Both swap via `.env`, no code change
 
 ## Setup
 
