@@ -1,8 +1,10 @@
 // The greeting (the composer itself lives in <Composer/>, above both views).
 // Anchored to the composer: its bottom sits one gap above the composer's home-position
 // top edge, so neither element needs the other's height at build time.
+// --kb-inset matches the composer's own lift (see Composer's FLOOR) so the two rise
+// together when the mobile keyboard opens, instead of the box sliding over the text.
 const POSITION = {
-  bottom: 'calc(50% + 0.5rem + var(--composer-h, 0px) / 2)',
+  bottom: 'calc(50% + 0.5rem + var(--composer-h, 0px) / 2 + var(--kb-inset, 0px))',
   opacity: 'var(--settle-inv)',
 }
 
