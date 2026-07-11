@@ -29,7 +29,18 @@ export const env = {
   chat: {
     // Any OpenAI-compatible base URL — the service appends /chat/completions.
     baseUrl: str(import.meta.env.VITE_CHAT_BASE_URL, 'https://api.synthetic.new/v1'),
-    model: str(import.meta.env.VITE_CHAT_MODEL, 'hf:MiniMaxAI/MiniMax-M3'),
+    // Synthetic's catalogue, measured on an identical 300-token completion.
+    // All are always-on, so none pays a cold start; pick on speed vs. ability.
+    //   hf:openai/gpt-oss-120b                  ~89 tok/s  131K  text
+    //   hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4  ~72 tok/s  262K  text
+    //   hf:Qwen/Qwen3.6-27B                     ~63 tok/s  262K  vision — fastest with images
+    //   hf:zai-org/GLM-4.7-Flash                ~54 tok/s  196K  text
+    //   hf:MiniMaxAI/MiniMax-M3                 ~16 tok/s  262K  vision
+    //   hf:moonshotai/Kimi-K2.7-Code                        262K  vision — 504'd under load
+    //   hf:zai-org/GLM-5.2                                  524K  text   — 504'd under load
+    // The last four reason before answering, so the wait is longer than tok/s alone
+    // implies — the thinking tokens are billed and timed but never shown.
+    model: str(import.meta.env.VITE_CHAT_MODEL, 'hf:openai/gpt-oss-120b'),
     // VITE_SYNTHETIC_API_KEY is the pre-rename name, still honoured.
     apiKey:
       str(import.meta.env.VITE_CHAT_API_KEY) ||
