@@ -25,7 +25,11 @@ export default function MessageList() {
 
   // The composer floats over this list. A mask dissolves the messages underneath
   // instead of covering them (an opaque gradient div would hide the wave).
-  const clearance = 'calc(var(--composer-h, 0px) + 3rem)'
+  //
+  // The gap is generous on purpose: at rest the last message should clear the
+  // composer, not tuck under its top edge — the fade is for what you scroll
+  // past, not for where the conversation stops.
+  const clearance = 'calc(var(--composer-h, 0px) + 6rem)'
   const fade = `linear-gradient(to top, transparent 0, #000 ${clearance})`
 
   return (

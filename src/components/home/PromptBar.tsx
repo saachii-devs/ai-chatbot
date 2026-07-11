@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { useChat } from '../../hooks/useChat'
 import { useVoiceCall } from '../../hooks/useVoiceCall'
+import { useCall } from '../../state/CallContext'
 import { useFluid } from '../../state/FluidContext'
 import { useSessions } from '../../state/SessionsContext'
 import { AudioLinesIcon, SendIcon, StopIcon } from '../icons'
 import Button from '../ui/Button'
+import Tooltip from '../ui/Tooltip'
 import GradientGlow from './GradientGlow'
 
 // Longer than this is a paste accident: unbounded it bloats the request body and the
@@ -15,10 +17,18 @@ const COUNTER_VISIBLE_FROM = MAX_DRAFT_CHARS - 500
 export default function PromptBar() {
   const [draft, setDraft] = useState('')
   const { sendMessage, stop, isLoading } = useChat()
-  const { startCall } = useVoiceCall()
+  const { startCall, endCall, isSupported } = useVoiceCall()
+  const { status: voiceStatus } = useCall()
   const { registerComposer, setPulse, emitRipple } = useFluid()
   const { state } = useSessions()
   const hasText = draft.trim().length > 0
+
+  // One input mode at a time. The bar stays — the composer is where Stop lives
+  // now — but typing is inert while the mic is open, so a half-typed draft can
+  // never race an utterance to the same session.
+  const voiceActive = voiceStatus !== 'idle'
+
+  const voiceSupported = isSupported()
 
   const boxRef = useRef<HTMLDivElement | null>(null)
   const sendRef = useRef<HTMLButtonElement | null>(null)
@@ -64,11 +74,14 @@ export default function PromptBar() {
         ref={boxRef}
         className="composer-pad composer-ring relative flex w-full flex-col gap-2 rounded-[1.75rem] bg-neutral-900 sm:flex-row sm:items-end sm:rounded-full"
       >
-        {/* Stays editable while a reply streams — only sending is held back. */}
+        {/* Stays editable while a reply streams — only sending is held back.
+            Voice is the exception: while the mic is open this is disabled
+            outright, so the two input modes can never both be live. */}
         <textarea
           ref={inputRef}
           rows={1}
           value={draft}
+          disabled={voiceActive}
           maxLength={MAX_DRAFT_CHARS}
           onChange={(e) => setDraft(e.target.value.slice(0, MAX_DRAFT_CHARS))}
           onKeyDown={(e) => {
@@ -80,7 +93,7 @@ export default function PromptBar() {
               handleSend()
             }
           }}
-          placeholder="Ask Assistant"
+          placeholder={voiceActive ? 'Listening — press Stop to type' : 'Ask Assistant'}
           aria-label="Message"
           // outline-none kills the always-on focus ring, so the keyboard-only ring must be
           // handed back explicitly. dvh not vh: the mobile URL bar must not push the box off-screen.
@@ -99,12 +112,52 @@ export default function PromptBar() {
         )}
 
         <div className="flex items-center justify-between gap-2 sm:shrink-0">
-          <Button variant="pill" size="text" onClick={() => void startCall()}>
-            <AudioLinesIcon className="size-4" />
-            Voice
-          </Button>
+          {/* One button, two states: it starts the session and it ends it. Stop
+              belongs where Start was — nowhere else on screen is there anything
+              to press, because the voice interface itself has no chrome.
 
-          {isLoading ? (
+              The other half of "one mode at a time" is the disable: voice cannot
+              start while a typed reply is still streaming, so the two can never
+              both own the conversation. An unsupported browser says so rather
+              than starting a session that dies on the first API call. */}
+          {voiceActive ? (
+            <Button
+              variant="dangerSolid"
+              size="text"
+              onClick={endCall}
+              aria-label="Stop voice"
+              className="animate-fade-in"
+            >
+              <StopIcon className="size-3.5" />
+              Stop
+            </Button>
+          ) : (
+            <Tooltip
+              label={
+                !voiceSupported
+                  ? 'Voice is not supported in this browser'
+                  : isLoading
+                    ? 'Wait for the reply to finish'
+                    : 'Start voice'
+              }
+            >
+              <Button
+                variant="pill"
+                size="text"
+                onClick={() => void startCall()}
+                disabled={!voiceSupported || isLoading}
+              >
+                <AudioLinesIcon className="size-4" />
+                Voice
+              </Button>
+            </Tooltip>
+          )}
+
+          {/* A voice turn streams through the same send path, so `isLoading` is
+              true mid-reply. Don't offer the chat's stop button then: the red
+              one beside it already ends the session, and two different stops
+              would be two different meanings. */}
+          {isLoading && !voiceActive ? (
             <Button
               variant="bare"
               onClick={stop}
@@ -122,7 +175,7 @@ export default function PromptBar() {
               ref={sendRef}
               variant="primary"
               onClick={handleSend}
-              disabled={!hasText}
+              disabled={!hasText || voiceActive}
               aria-label="Send message"
             >
               <SendIcon className="size-5" />

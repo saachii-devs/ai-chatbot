@@ -39,10 +39,21 @@ export type SessionsAction =
   // Rewinds to just before `messageId`, dropping it and everything after; retry
   // uses it to take back the partial reply of the failed turn.
   | { type: 'MESSAGES_REWOUND'; sessionId: string; messageId: string }
-  | { type: 'CALL_LOGGED'; sessionId: string; message: Message }
+  // A voice session begins: drop a header into the transcript that the spoken
+  // turns then appear beneath. Its duration isn't known yet — CALL_ENDED fills
+  // it in when the session stops.
+  | { type: 'CALL_STARTED'; sessionId: string; message: Message }
+  | {
+      type: 'CALL_ENDED'
+      sessionId: string
+      messageId: string
+      durationMs: number
+      content: string
+    }
   | { type: 'ERROR_DISMISSED'; sessionId: string }
-  // Another tab wrote to localStorage; adopt what it saved.
-  | { type: 'SESSIONS_SYNCED'; sessions: ChatSession[] }
+  // Another tab wrote to localStorage; adopt what it saved. `deletedIds` is the
+  // union of both tabs' tombstones — see storage.mergeIncoming.
+  | { type: 'SESSIONS_SYNCED'; sessions: ChatSession[]; deletedIds: string[] }
   // A save failed, or started succeeding again.
   | { type: 'STORAGE_WARNING_SET'; message: string }
   | { type: 'STORAGE_WARNING_CLEARED' }
@@ -50,10 +61,15 @@ export type SessionsAction =
 export const initialState: SessionsState = {
   sessions: [],
   activeSessionId: null, // null = no chat open → App shows HomeView
+  deletedIds: [],
   loadingSessionIds: [],
   errors: {},
   storageWarning: null,
 }
+
+// Tombstones are bounded and newest-first; see storage.MAX_DELETED for why
+// forgetting the oldest is safe.
+const MAX_DELETED = 500
 
 // Replace one session with a transformed copy (immutably).
 function updateSession(
@@ -115,6 +131,10 @@ export function sessionsReducer(
       return {
         ...state,
         sessions: state.sessions.filter((s) => s.id !== action.sessionId),
+        // Say so out loud, or another tab holding this chat cannot tell the
+        // delete from a snapshot that simply predates it — and would write the
+        // chat back.
+        deletedIds: [action.sessionId, ...state.deletedIds].slice(0, MAX_DELETED),
         // Deleting the OPEN chat resets to null (→ HomeView) so it can't point
         // at a ghost.
         activeSessionId:
@@ -228,12 +248,27 @@ export function sessionsReducer(
         return cut === -1 ? s : { ...s, messages: s.messages.slice(0, cut) }
       })
 
-    case 'CALL_LOGGED':
-      // A voice call's only trace in the chat: a duration marker bubble.
+    case 'CALL_STARTED':
+      // Appended, not nested: everything said during the call follows it as
+      // ordinary messages. The marker is a heading for them, not a container.
       return updateSession(state, action.sessionId, (s) => ({
         ...s,
+        // A call started from the home screen titles the chat, since no typed
+        // message will ever get the chance to.
+        title: s.messages.length === 0 ? 'Voice call' : s.title,
         updatedAt: action.message.createdAt,
         messages: [...s.messages, action.message],
+      }))
+
+    case 'CALL_ENDED':
+      // The header was written before the duration existed; stamp it now.
+      return updateSession(state, action.sessionId, (s) => ({
+        ...s,
+        messages: s.messages.map((m) =>
+          m.id === action.messageId
+            ? { ...m, content: action.content, durationMs: action.durationMs }
+            : m,
+        ),
       }))
 
     case 'ERROR_DISMISSED':
@@ -241,7 +276,8 @@ export function sessionsReducer(
 
     case 'SESSIONS_SYNCED': {
       // The other tab's write wins, except the session open here may be
-      // mid-stream and is never yanked away (see storage.mergeIncoming).
+      // mid-stream and is never yanked away — unless it was deleted, which is
+      // the one absence that is unambiguous (see storage.mergeIncoming).
       const sessions = action.sessions
       const alive = new Set(sessions.map((s) => s.id))
       const stillOpen = sessions.some((s) => s.id === state.activeSessionId)
@@ -253,6 +289,9 @@ export function sessionsReducer(
       return {
         ...state,
         sessions,
+        deletedIds: action.deletedIds,
+        // The open chat was deleted elsewhere → null → App falls back to
+        // HomeView, and useSessionRoute strips ?chat= from the URL.
         activeSessionId: stillOpen ? state.activeSessionId : null,
         loadingSessionIds: state.loadingSessionIds.filter((id) => alive.has(id)),
         errors,

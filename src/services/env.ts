@@ -62,7 +62,12 @@ export const env = {
     lang: str(import.meta.env.VITE_VOICE_LANG, 'en-US'),
     // Mic RMS (0..1) below which audio is treated as room noise and dropped;
     // judges distance only. 0 disables the gate. Tune to the mic and room.
-    noiseGateRms: level(import.meta.env.VITE_VOICE_NOISE_GATE_RMS, 0.03),
+    //
+    // Deliberately low: a soft or distant voice must still get through, and the
+    // cost of setting this too HIGH is that such a speaker is never heard at all
+    // — a failure they cannot diagnose. Too low merely sends some room tone,
+    // which the transcriber discards. Err on the side of hearing.
+    noiseGateRms: level(import.meta.env.VITE_VOICE_NOISE_GATE_RMS, 0.012),
   },
 } as const
 

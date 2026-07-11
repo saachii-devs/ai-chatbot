@@ -1,16 +1,24 @@
 import { env, type VoiceConfig } from '../env'
 import {
+  hasMicAndAudio,
   VoiceServiceError,
+  type SpeechProgress,
   type VoiceEventHandlers,
   type VoiceService,
 } from '../voiceService'
+import { watchMicTrack } from './micTrack'
 
 // Browser-native VoiceService: SpeechRecognition (STT) + speechSynthesis (TTS),
 // Chrome/Edge only (else 'unsupported'). Barge-in via an RMS mic meter; drop
 // transcripts while speaking, else Chrome transcribes the assistant's own voice.
 
-const BARGE_IN_RMS = 0.03
-const BARGE_IN_SECONDS = 0.2
+// How loud you must be to take the floor back from the assistant. Low, so a
+// quiet voice can still interrupt — the hold below is what keeps room tone from
+// tripping it, rather than a high bar that only a raised voice clears.
+const BARGE_IN_RMS = 0.015
+// Sustained for this long, so a cough or a keyboard tap is not an interruption.
+// Lengthened alongside the lower threshold: the two together are the filter.
+const BARGE_IN_SECONDS = 0.3
 const METER_INTERVAL_MS = 50
 
 // Chrome silently pauses synthesis after ~15s; poke resume() on a timer.
@@ -69,16 +77,24 @@ export class BrowserVoiceService implements VoiceService {
   private hotTicks = 0
   private meterTimer: number | undefined
   private keepaliveTimer: number | undefined
+  private unwatchMic: (() => void) | null = null
 
   constructor(config: VoiceConfig = env.voice) {
     this.config = config
   }
 
+  // Speech recognition is Chrome/Edge only, and the RMS barge-in meter needs a
+  // mic and an audio graph. Firefox and Safari have neither recogniser.
+  isSupported(): boolean {
+    return hasMicAndAudio() && recognitionCtor() !== null && 'speechSynthesis' in window
+  }
+
   async startListening(handlers: VoiceEventHandlers): Promise<void> {
+    // The button is gated on isSupported(); this is the backstop for anyone
+    // calling in directly.
+    if (!this.isSupported()) throw new VoiceServiceError('unsupported')
     const Ctor = recognitionCtor()
-    if (!Ctor || !('speechSynthesis' in window)) {
-      throw new VoiceServiceError('unsupported')
-    }
+    if (!Ctor) throw new VoiceServiceError('unsupported')
     this.handlers = handlers
     this.listening = true
     this.opened = false
@@ -98,10 +114,16 @@ export class BrowserVoiceService implements VoiceService {
       throw new VoiceServiceError('mic_denied')
     }
 
+    // The mic can be taken back at any moment; the session cannot outlive it.
+    this.unwatchMic = watchMicTrack(this.mediaStream, () => handlers.onMicLost())
+
     this.audioContext = new AudioContext()
     this.source = this.audioContext.createMediaStreamSource(this.mediaStream)
     this.micAnalyser = this.audioContext.createAnalyser()
-    this.micAnalyser.fftSize = 256
+    // This context runs at the device rate (~48kHz), not the 16kHz the ElevenLabs
+    // provider captures at — so a 256-point FFT would put barely 20 bins under
+    // 4kHz for the visualizer's 56 bars. See the note on FREQ_MIN in Visualizer.
+    this.micAnalyser.fftSize = 1024
     this.source.connect(this.micAnalyser)
 
     const recognition = new Ctor()
@@ -206,6 +228,11 @@ export class BrowserVoiceService implements VoiceService {
     window.clearInterval(this.keepaliveTimer)
     this.keepaliveTimer = undefined
 
+    // Before the tracks are stopped: stopping one fires 'ended', which would
+    // report our own hang-up as the mic being snatched away.
+    this.unwatchMic?.()
+    this.unwatchMic = null
+
     if ('speechSynthesis' in window) window.speechSynthesis.cancel()
 
     if (this.recognition) {
@@ -229,13 +256,27 @@ export class BrowserVoiceService implements VoiceService {
     this.handlers = null
   }
 
-  async speak(text: string, signal?: AbortSignal): Promise<void> {
+  async speak(
+    text: string,
+    signal?: AbortSignal,
+    onProgress?: SpeechProgress,
+  ): Promise<void> {
     if (!('speechSynthesis' in window)) throw new VoiceServiceError('unsupported')
     if (signal?.aborted) return
 
     const synth = window.speechSynthesis
     const utterance = new SpeechSynthesisUtterance(text)
     utterance.lang = this.config.lang
+
+    // The engine tells us which word it is saying, as it says it — exactly what
+    // the caption needs, and as tight as this can get without audio analysis.
+    //
+    // charIndex ONLY. charLength is optional in the spec and most engines return
+    // 0, so adding it to reach the word's end would, on those engines, resolve to
+    // the word's start and light every word one behind the voice.
+    utterance.onboundary = (event) => {
+      onProgress?.(event.charIndex)
+    }
     const voice = await this.resolveVoice()
     if (voice) utterance.voice = voice
     if (signal?.aborted) return // resolveVoice can await; hang-up may have landed
@@ -265,7 +306,10 @@ export class BrowserVoiceService implements VoiceService {
           { once: true },
         )
 
-        utterance.onend = () => resolve()
+        utterance.onend = () => {
+          onProgress?.(text.length) // the last word has no boundary after it
+          resolve()
+        }
         // A cancelled utterance fires onerror too; resolve either way.
         utterance.onerror = () => resolve()
         synth.speak(utterance)

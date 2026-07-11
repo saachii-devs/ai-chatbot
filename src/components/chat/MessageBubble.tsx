@@ -7,12 +7,16 @@ import AssistantRow from './AssistantRow'
 import { ASSISTANT_BUBBLE, USER_BUBBLE } from './bubbleStyles'
 import Markdown from './Markdown'
 
-// A voice call collapses to one line in the chat; click to unfold the transcript,
-// which rides on the marker itself so it survives a reload with the session.
+// The header a voice session leaves behind: "Voice call · 2m 34s". What was said
+// during it follows BELOW as ordinary bubbles, so there is nothing to unfold —
+// the pill is just a divider announcing where the call began.
+//
+// The expandable branch is legacy: voice used to nest its whole transcript in
+// `turns` inside this marker. Nothing writes that any more, but sessions saved
+// by the old build still carry it, and dropping this would strand their history.
 function CallMarker({ message }: { message: Message }) {
   const [open, setOpen] = useState(false)
   const turns = message.turns ?? []
-  // Nothing to show for calls that failed before anyone spoke, or old markers with no turns.
   const expandable = turns.length > 0
 
   return (

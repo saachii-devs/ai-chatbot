@@ -1,9 +1,12 @@
 import { env, type VoiceConfig } from '../env'
 import {
+  hasMicAndAudio,
   VoiceServiceError,
+  type SpeechProgress,
   type VoiceEventHandlers,
   type VoiceService,
 } from '../voiceService'
+import { watchMicTrack } from './micTrack'
 
 // ElevenLabs VoiceService: STT over the Scribe realtime WebSocket (raw PCM as
 // base64 JSON, authed with a single-use REST token — socket rejects raw keys);
@@ -29,6 +32,11 @@ const NOISE_GATE_PREROLL_SECONDS = 0.2
 // giving up (mic and audio graph are still live).
 const MAX_RECONNECT_ATTEMPTS = 3
 const RECONNECT_BASE_MS = 500
+
+// How long the mic stays gated after the reply stops playing. Covers the audio
+// already in flight up the socket plus the room's reverb — both of which are the
+// assistant, arriving late.
+const MIC_REOPEN_DELAY_MS = 400
 
 export class ElevenLabsVoiceService implements VoiceService {
   private readonly config: VoiceConfig
@@ -63,6 +71,22 @@ export class ElevenLabsVoiceService implements VoiceService {
   private closing = false
   private reconnectAttempts = 0
   private reconnectTimer: number | undefined
+  private unwatchMic: (() => void) | null = null
+
+  // True while the reply is coming out of the speakers. The mic is still open and
+  // still hears it — echo cancellation reduces that, it does not remove it — so
+  // without this the transcriber commits the ASSISTANT'S OWN WORDS as if the user
+  // had said them, and the app answers itself. browser.ts has always gated on this
+  // (see its onresult); this provider never did.
+  private speaking = false
+  // The tail after playback stops: audio already in flight up the socket, and the
+  // room's own reverb, still arrive for a moment. Keep the gate shut across it, or
+  // the last few words come back as a phantom utterance.
+  private muteUntilMs = 0
+
+  private micIsMuted(): boolean {
+    return this.speaking || Date.now() < this.muteUntilMs
+  }
 
 
   constructor(config: VoiceConfig = env.voice) {
@@ -76,7 +100,18 @@ export class ElevenLabsVoiceService implements VoiceService {
       `?output_format=${config.ttsOutputFormat}`
   }
 
+  // Streams raw PCM up a WebSocket via a ScriptProcessor, so it needs the audio
+  // graph and a socket, but no speech APIs — this one works in Firefox/Safari.
+  isSupported(): boolean {
+    return (
+      hasMicAndAudio() &&
+      typeof WebSocket !== 'undefined' &&
+      typeof AudioContext.prototype.createScriptProcessor === 'function'
+    )
+  }
+
   async startListening(handlers: VoiceEventHandlers): Promise<void> {
+    if (!this.isSupported()) throw new VoiceServiceError('unsupported')
     const apiKey = this.config.apiKey
     if (!apiKey) throw new VoiceServiceError('missing_key')
     this.closing = false
@@ -95,6 +130,9 @@ export class ElevenLabsVoiceService implements VoiceService {
     } catch {
       throw new VoiceServiceError('mic_denied')
     }
+
+    // The mic can be taken back at any moment; the session cannot outlive it.
+    this.unwatchMic = watchMicTrack(this.mediaStream, () => handlers.onMicLost())
 
     // Ask for 16kHz; browsers that ignore it (e.g. Safari) give 44.1/48kHz,
     // which the API also accepts — we declare whatever rate we got.
@@ -155,11 +193,17 @@ export class ElevenLabsVoiceService implements VoiceService {
             handlers.onOpen()
             this.startPcmPump()
             break
+          // While the assistant is audible, anything the transcriber returns is
+          // the assistant — the mic is hearing the speakers. Passing it on makes
+          // the app interrupt its own reply and then answer itself, which is what
+          // the phantom utterances were. Drop it: nothing said over the top of the
+          // assistant on THIS provider is usable, because it has no way to tell
+          // the two voices apart.
           case 'partial_transcript': // interim — may still change
-            if (msg.text) handlers.onInterim(msg.text)
+            if (msg.text && !this.micIsMuted()) handlers.onInterim(msg.text)
             break
           case 'committed_transcript': // final — one finished utterance
-            if (msg.text?.trim()) handlers.onFinal(msg.text.trim())
+            if (msg.text?.trim() && !this.micIsMuted()) handlers.onFinal(msg.text.trim())
             break
           case 'auth_error':
           case 'quota_exceeded':
@@ -244,6 +288,17 @@ export class ElevenLabsVoiceService implements VoiceService {
     this.processor.onaudioprocess = (e) => {
       if (this.socket?.readyState !== WebSocket.OPEN) return
       const floats = e.inputBuffer.getChannelData(0)
+
+      // The assistant is audible: send silence, not what the mic hears. Dropping
+      // the messages alone is not enough — the server's VAD would still be
+      // building an utterance out of the assistant's voice, and would commit it
+      // the moment the gate reopened. Silence keeps the VAD's picture honest.
+      if (this.micIsMuted()) {
+        this.resetNoiseGate()
+        this.send(new Int16Array(floats.length))
+        return
+      }
+
       const pcm = toPcm(floats)
 
       // Under the line: hold the buffer back (may be a word starting) and send
@@ -327,9 +382,16 @@ export class ElevenLabsVoiceService implements VoiceService {
     // Set BEFORE closing the socket, or onclose reads the hang-up as a drop
     // and reconnects the call the user just ended.
     this.closing = true
+    this.speaking = false
+    this.muteUntilMs = 0
     window.clearTimeout(this.reconnectTimer)
     this.reconnectTimer = undefined
     this.reconnectAttempts = 0
+
+    // Before the tracks are stopped below: stopping one fires 'ended', which
+    // would report our own hang-up as the mic being snatched away.
+    this.unwatchMic?.()
+    this.unwatchMic = null
 
     // Tolerate any subset existing: hang-up can happen at any setup stage.
     this.audio?.pause() // stop a voice still talking after hang-up
@@ -358,7 +420,11 @@ export class ElevenLabsVoiceService implements VoiceService {
     this.socket = null
   }
 
-  async speak(text: string, signal?: AbortSignal): Promise<void> {
+  async speak(
+    text: string,
+    signal?: AbortSignal,
+    onProgress?: SpeechProgress,
+  ): Promise<void> {
     const apiKey = this.config.apiKey
     if (!apiKey) throw new VoiceServiceError('missing_key')
 
@@ -383,12 +449,18 @@ export class ElevenLabsVoiceService implements VoiceService {
     const audio = new Audio(url)
     // Held outside the try so `finally` can tear the graph down on any exit.
     let disconnectAnalyser: (() => void) | null = null
+    let progressRaf = 0
     try {
       // Hang-up can land in either await above; bail before making a sound.
       if (signal?.aborted) return
 
       this.audio = audio
       disconnectAnalyser = this.analyseTts(audio)
+
+      // Shut the mic's path to the transcriber for as long as we are audible.
+      // Set BEFORE play(), or the first syllable is already on its way up the
+      // socket by the time the flag lands.
+      this.speaking = true
 
       // play() rejects either because we paused (hang-up/barge-in, expected) or
       // the browser refused a sound (autoplay); distinguished below, not swallowed.
@@ -408,7 +480,32 @@ export class ElevenLabsVoiceService implements VoiceService {
           resolve()
         }, { once: true })
 
-        audio.onended = () => resolve()
+        // An MP3 carries no word boundaries, so where the voice IS gets
+        // interpolated from how far into the audio we are.
+        //
+        // Sampled per FRAME, not from 'timeupdate': that event fires only ~4×
+        // a second, so the highlight advanced in visible jumps. requestAnimation-
+        // Frame reads the same playback clock 60× a second, which is what makes
+        // the sweep smooth. It is tied to the audio clock either way, so it can
+        // never run ahead of the voice.
+        //
+        // Weighted by characters, so long words are dwelt on and short ones
+        // passed over — closer to how speech actually paces than counting words
+        // evenly would be.
+        const tick = () => {
+          const { currentTime, duration } = audio
+          // A streamed blob reports Infinity until its metadata lands.
+          if (Number.isFinite(duration) && duration > 0) {
+            onProgress?.(Math.round((currentTime / duration) * text.length))
+          }
+          progressRaf = requestAnimationFrame(tick)
+        }
+        progressRaf = requestAnimationFrame(tick)
+
+        audio.onended = () => {
+          onProgress?.(text.length)
+          resolve()
+        }
         audio.onerror = () => resolve()
         // play() rejects if paused before it resolves; the abort listener has
         // already settled us then.
@@ -427,6 +524,17 @@ export class ElevenLabsVoiceService implements VoiceService {
     } catch (err) {
       throw err instanceof VoiceServiceError ? err : new VoiceServiceError('tts_failed')
     } finally {
+      // Reopen the mic, but not instantly: audio captured while it was still
+      // talking is already in flight up the socket, and the room's reverb lags
+      // the speaker. Reopening on the same tick lets that tail come back as a
+      // phantom utterance — the very thing this gate exists to stop.
+      this.speaking = false
+      this.muteUntilMs = Date.now() + MIC_REOPEN_DELAY_MS
+
+      // The frame loop outlives the promise on every exit path — abort, error,
+      // end — and would otherwise run for the life of the tab, driving a caption
+      // that is no longer on screen.
+      cancelAnimationFrame(progressRaf)
       disconnectAnalyser?.()
       // Only if we still own the element: an interruption starts the next turn
       // before this unwinds, and clobbering its audio would mute that reply.
@@ -455,7 +563,16 @@ export class ElevenLabsVoiceService implements VoiceService {
 
       const source = ctx.createMediaElementSource(audio)
       const analyser = ctx.createAnalyser()
-      analyser.fftSize = 256 // 128 bins, matching the mic analyser
+      // Finer than the mic's, because this context runs at the device rate
+      // (~48kHz) rather than the 16kHz capture rate. At fftSize 256 a bin is
+      // ~190Hz wide, so barely 20 bins cover the whole speech band and 56 bars
+      // would fight over them. 1024 gives ~47Hz bins — plenty below 4kHz.
+      analyser.fftSize = 1024
+      // Damped above the 0.8 default, but only the REPLY's analyser — the mic is
+      // a meter and must stay live. TTS holds a near-constant level, so averaging
+      // its bins over a few more frames costs no expressiveness and takes the
+      // shiver out before the visualizer ever sees it.
+      analyser.smoothingTimeConstant = 0.9
       source.connect(analyser)
       analyser.connect(ctx.destination) // without this the reply is silent
       this.ttsAnalyser = analyser

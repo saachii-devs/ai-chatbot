@@ -4,22 +4,31 @@ import HomeView from './components/home/HomeView'
 import ChatView from './components/chat/ChatView'
 import Composer from './components/home/Composer'
 import FluidCanvas from './components/fluid/FluidCanvas'
-import CallOverlay from './components/voice/CallOverlay'
 import { ChevronRightIcon } from './components/icons'
 import Button from './components/ui/Button'
 import Tooltip from './components/ui/Tooltip'
 import { useKeyboardInset } from './hooks/useKeyboardInset'
 import { useMediaQuery } from './hooks/useMediaQuery'
+import { useSessionRoute } from './hooks/useSessionRoute'
+import { useVoiceGuards } from './hooks/useVoiceGuards'
 import { useSessions } from './state/SessionsContext'
 import { useCall } from './state/CallContext'
 import { useFluid } from './state/FluidContext'
-import { BELOW_MD, RAIL_WIDTH } from './utils/breakpoints'
+import { BELOW_MD, RAIL_COLLAPSED_WIDTH_MD, RAIL_WIDTH } from './utils/breakpoints'
 
 function App() {
   const { state, dispatch } = useSessions()
   const { status: callStatus } = useCall()
   const { phase, setSettleTarget } = useFluid()
   const [railOpen, setRailOpen] = useState(false)
+  // True from the moment the rail is toggled until its width lands. Only used to
+  // clip the rail while it moves — see the shell below.
+  const [railAnimating, setRailAnimating] = useState(false)
+
+  const toggleRail = (open: boolean) => {
+    setRailAnimating(true)
+    setRailOpen(open)
+  }
 
   // Below md the rail is a drawer; above, it is layout. Reactive read so
   // rotating a phone into landscape re-classifies the rail correctly.
@@ -29,8 +38,19 @@ function App() {
   // not to any one field.
   useKeyboardInset()
 
-  // The view is derived from which session is open, never stored separately.
-  const view = state.activeSessionId ? 'chat' : 'home'
+  // Same reason: the address bar is the window's, and one mirror of it is the
+  // only way it stays consistent. Keeps ?chat=<id> in step with the open chat.
+  useSessionRoute()
+
+  // Mounted here, not in VoicePanel: these guards must outlive the panel they
+  // guard, which unmounts the moment voice goes idle.
+  useVoiceGuards()
+
+  // The view is derived, never stored. Voice counts as being in a chat even
+  // before one exists: starting it from the home screen shows the (empty)
+  // transcript with the voice panel below it, and the first utterance creates
+  // the session — so a run that never hears a word leaves no empty chat behind.
+  const view = state.activeSessionId || callStatus !== 'idle' ? 'chat' : 'home'
 
   // First paint snaps instead of animating — a restored session should not
   // play the sink.
@@ -46,7 +66,7 @@ function App() {
     if (!railOpen || !isDrawer) return
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setRailOpen(false)
+      if (event.key === 'Escape') toggleRail(false)
     }
     window.addEventListener('keydown', onKeyDown)
 
@@ -67,14 +87,15 @@ function App() {
 
   // Picking a chat in a drawer must dismiss it; on desktop the rail stays open.
   const dismissDrawerOnNavigate = () => {
-    if (isDrawer) setRailOpen(false)
+    if (isDrawer) toggleRail(false)
   }
 
   return (
     <div className="relative flex h-dvh overflow-hidden bg-neutral-950 text-neutral-200">
-      {/* Floating opener, only while the sidebar is closed. Offset by the
-          safe-area inset so it clears the notch in landscape. */}
-      {!railOpen && (
+      {/* Floating opener — drawers only. A closed desktop rail collapses to icons
+          and carries its own opener. Offset by the safe-area inset so it clears
+          the notch in landscape. */}
+      {!railOpen && isDrawer && (
         <div
           className="animate-fade-in fixed z-30"
           style={{
@@ -85,7 +106,7 @@ function App() {
           <Tooltip label="Open sidebar">
             <Button
               size="iconLg"
-              onClick={() => setRailOpen(true)}
+              onClick={() => toggleRail(true)}
               aria-label="Open sidebar"
               aria-expanded={false}
             >
@@ -99,23 +120,39 @@ function App() {
       {railOpen && isDrawer && (
         <div
           className="animate-fade-in fixed inset-0 z-10 bg-black/60"
-          onClick={() => setRailOpen(false)}
+          onClick={() => toggleRail(false)}
           aria-hidden
         />
       )}
 
-      {/* Collapsible rail. On desktop opening it PUSHES the chat; on phones it
-          stays a slide-over drawer (pushing would squeeze the chat to nothing). */}
+      {/* Collapsible rail. On desktop it narrows to an icon strip and PUSHES the
+          chat; on phones it stays a slide-over drawer that leaves nothing behind
+          (an icon strip would eat width the chat cannot spare).
+
+          The clip is transient, not permanent: it exists so the wide content does
+          not spill past the shell while the width animates. Once settled, a
+          collapsed rail must let its tooltips out — at 4rem wide, everything it
+          can say is wider than it is. */}
       <div
-        className={`z-20 shrink-0 overflow-hidden bg-neutral-950 transition-all duration-300 ease-out max-md:fixed max-md:inset-y-0 max-md:left-0 ${
+        // Every property on this shell shares one duration, so whichever lands
+        // first, the move is over. Bubbled ends from the rail's own contents are
+        // not — hence the target check.
+        onTransitionEnd={(e) => {
+          if (e.target === e.currentTarget) setRailAnimating(false)
+        }}
+        className={`z-20 shrink-0 border-neutral-800 bg-neutral-950 transition-all duration-300 ease-out max-md:fixed max-md:inset-y-0 max-md:left-0 md:border-r ${
+          railAnimating ? 'overflow-hidden' : 'overflow-hidden md:overflow-visible'
+        } ${
           railOpen
-            ? `${RAIL_WIDTH} border-r border-neutral-800 max-md:translate-x-0`
-            : `md:w-0 ${RAIL_WIDTH} max-md:-translate-x-full`
+            ? `${RAIL_WIDTH} border-r max-md:translate-x-0`
+            : `${RAIL_COLLAPSED_WIDTH_MD} ${RAIL_WIDTH} max-md:-translate-x-full`
         }`}
       >
         <IconRail
+          collapsed={!railOpen && !isDrawer}
           onNewChat={startNewChat}
-          onClose={() => setRailOpen(false)}
+          onOpen={() => toggleRail(true)}
+          onClose={() => toggleRail(false)}
           onNavigate={dismissDrawerOnNavigate}
         />
       </div>
@@ -129,7 +166,6 @@ function App() {
         {phase !== 'home' && <ChatView />}
         <Composer />
       </main>
-      {callStatus !== 'idle' && <CallOverlay />}
     </div>
   )
 }

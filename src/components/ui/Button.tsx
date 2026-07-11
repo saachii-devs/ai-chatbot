@@ -12,6 +12,7 @@ export type ButtonVariant =
   | 'bare'
   | 'subtle'
   | 'danger'
+  | 'dangerSolid'
   | 'warn'
   | 'dangerOutline'
 
@@ -37,6 +38,8 @@ const VARIANTS: Record<ButtonVariant, string> = {
   bare: 'text-neutral-300 hover:text-neutral-100',
   subtle: 'text-neutral-500 hover:bg-neutral-700 hover:text-neutral-100',
   danger: 'text-red-300 hover:bg-red-900/50',
+  // Filled, for a stop that has to be the loudest thing on screen.
+  dangerSolid: 'bg-red-600 text-white hover:bg-red-500',
   warn: 'text-amber-300 hover:bg-amber-900/50',
   dangerOutline:
     'border border-red-800 font-medium text-red-300 enabled:hover:bg-red-900/50 disabled:opacity-50',

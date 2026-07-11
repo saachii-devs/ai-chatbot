@@ -1,4 +1,10 @@
 import { ChatServiceError, type ReplyOutcome } from '../services/chatService'
+import {
+  abortSession,
+  isInFlight,
+  releaseRequest,
+  trackRequest,
+} from '../services/inFlight'
 import { chatService } from '../services/providers'
 import { useSessions } from '../state/SessionsContext'
 import type { ChatSession, Message } from '../types'
@@ -6,22 +12,12 @@ import { uuid } from '../utils/uuid'
 
 // Bridges components and the network-only chat service:
 // optimistic send → stream chunks into state → settle success, stop, or failure.
-
-// Module scope so the component that starts a send and the one offering the stop
-// button (separate hook instances) share one controller. Keyed by session, and
-// written synchronously so two Enter presses in one tick can't both pass the
-// "already sending" check the way a state read would.
-const inFlight = new Map<string, AbortController>()
+// The in-flight controllers live in ../services/inFlight, shared with the tab-sync
+// path that has to abort a stream when another tab deletes the chat.
 
 // A send whose session doesn't exist yet, so has no id to key by. Only one can
 // exist: a second same-tick Enter still sees activeSessionId === null.
 let creatingSession = false
-
-// Stops the reply streaming into a session. Deleting a chat calls this, else the
-// request keeps dispatching chunks into a session that no longer exists.
-export function abortSession(sessionId: string): void {
-  inFlight.get(sessionId)?.abort()
-}
 
 function toFriendlyMessage(err: unknown): string {
   if (err instanceof ChatServiceError) {
@@ -81,10 +77,10 @@ export function useChat() {
     const trimmed = text.trim()
     if (!trimmed) return null
 
-    // Synchronous through `inFlight.set` so a second same-tick call sees these guards.
+    // Synchronous through `trackRequest` so a second same-tick call sees these guards.
     let sessionId = state.activeSessionId
     const active = state.sessions.find((s) => s.id === sessionId)
-    if (sessionId && inFlight.has(sessionId)) return null
+    if (sessionId && isInFlight(sessionId)) return null
     if (!sessionId && creatingSession) return null
 
     // Lazy session creation: sending from HomeView makes the chat exist.
@@ -106,7 +102,7 @@ export function useChat() {
     }
 
     const controller = new AbortController()
-    inFlight.set(sessionId, controller)
+    trackRequest(sessionId, controller)
 
     const userMessage: Message = {
       id: uuid(),
@@ -175,8 +171,7 @@ export function useChat() {
       })
       return null
     } finally {
-      // Only disown the controller if a later send hasn't replaced it.
-      if (inFlight.get(sessionId) === controller) inFlight.delete(sessionId)
+      releaseRequest(sessionId, controller)
       if (created) creatingSession = false
     }
   }

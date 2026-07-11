@@ -4,8 +4,18 @@ import type { CallTurn, ChatSession, Message } from '../types'
 // Never trust what comes back out: it may be corrupt, hand-edited, or stale.
 
 export const SESSIONS_KEY = 'ai-assistant.sessions'
+// Ids of deleted chats — a delete has to be stated, not inferred. A session
+// missing from another tab's snapshot is ambiguous: it may have been deleted, or
+// that tab may simply not have seen it yet (a chat is created in memory and
+// written 300ms later). Guessing wrong either resurrects a deleted chat or
+// destroys a new one, so the deleting tab records the id and every tab reads it.
+export const DELETED_KEY = 'ai-assistant.deleted'
 
 const MAX_SESSIONS = 100
+// Tombstones only have to outlive the tabs that could still be holding the
+// session in memory, so a bounded, newest-first list is enough. Ids are random
+// and never reissued, so forgetting an old one cannot cause a mix-up.
+const MAX_DELETED = 500
 // localStorage is ~5MB per origin, shared with everything else; stay well
 // under. Counted in UTF-16 code units, which is what the quota measures.
 const MAX_CHARS = 2_000_000
@@ -89,19 +99,62 @@ export function pruneToLimits(
   }
 }
 
-// Reconcile what another tab wrote with what this tab holds. Incoming is the
-// truth (so a delete propagates), except the active session — it may be
-// mid-stream and unflushed, so it is not yanked out from under the user.
+export function loadDeletedIds(): string[] {
+  try {
+    const raw = localStorage.getItem(DELETED_KEY)
+    if (!raw) return []
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((id): id is string => typeof id === 'string')
+  } catch {
+    // Corrupt: the worst case of forgetting a tombstone is a deleted chat coming
+    // back, which beats crashing on every launch.
+    return []
+  }
+}
+
+// Best-effort. If this write is lost the delete still holds in this tab; it just
+// may not reach the others, which is exactly where we were before tombstones.
+export function saveDeletedIds(ids: string[]): void {
+  try {
+    localStorage.setItem(DELETED_KEY, JSON.stringify(ids.slice(0, MAX_DELETED)))
+  } catch {
+    // quota or blocked — nothing useful to do, and the app still works
+  }
+}
+
+// Newest first, deduped, bounded. Union rather than replace: two tabs can each
+// delete a different chat before either sees the other's write.
+export function mergeDeletedIds(incoming: string[], local: string[]): string[] {
+  return [...new Set([...incoming, ...local])].slice(0, MAX_DELETED)
+}
+
+// Reconcile what another tab wrote with what this tab holds.
+//
+// Incoming is the truth, with one carve-out: the session open here may be
+// mid-stream and not yet written, so its absence from incoming is read as "that
+// tab hasn't seen it yet" and it is not yanked out from under the user.
+//
+// `deleted` is what makes that carve-out safe. Without it, a chat deleted in
+// another tab looks identical to an unflushed new one, so this function would
+// re-add it — and this tab's next save would write it back, resurrecting the
+// chat in the tab that deleted it. A tombstoned id is a real delete: honor it,
+// even for the active session, even mid-stream.
 export function mergeIncoming(
   incoming: ChatSession[],
   local: ChatSession[],
   activeSessionId: string | null,
+  deleted: ReadonlySet<string>,
 ): ChatSession[] {
-  if (!activeSessionId) return incoming
-  if (incoming.some((s) => s.id === activeSessionId)) return incoming
+  // The deleting tab's own save is debounced, so incoming can still contain a
+  // chat that is already tombstoned.
+  const alive = incoming.filter((s) => !deleted.has(s.id))
+
+  if (!activeSessionId || deleted.has(activeSessionId)) return alive
+  if (alive.some((s) => s.id === activeSessionId)) return alive
 
   const active = local.find((s) => s.id === activeSessionId)
-  return active ? [active, ...incoming] : incoming
+  return active ? [active, ...alive] : alive
 }
 
 // Browsers disagree on the name; both agree on the code.
@@ -123,6 +176,11 @@ function isValidSession(s: unknown): s is ChatSession {
     typeof c.createdAt === 'number' &&
     typeof c.updatedAt === 'number' &&
     Array.isArray(c.messages) &&
+    // A chat with nothing in it is not worth a slot, a sidebar row, or a URL.
+    // Creation is lazy so one should never reach here — this enforces it at the
+    // boundary rather than trusting that. Its id goes with it, and ids are
+    // random, so it is never handed out again.
+    c.messages.length > 0 &&
     c.messages.every(isValidMessage)
   )
 }
@@ -137,8 +195,10 @@ function isValidMessage(m: unknown): m is Message {
     typeof c.createdAt === 'number' &&
     (c.status === 'sending' || c.status === 'sent' || c.status === 'failed') &&
     (c.truncated === undefined || typeof c.truncated === 'boolean') &&
-    // A call marker's extra fields are read on render; an unchecked one crashes
-    // the app on load — the very crash ErrorBoundary then offers to clear.
+    // Legacy call markers (see types/index.ts). Nothing writes them any more,
+    // but old saved sessions still contain them, and their extra fields are read
+    // on render — an unchecked one crashes the app on load, the very crash
+    // ErrorBoundary then offers to clear.
     (c.kind === undefined || c.kind === 'call') &&
     (c.durationMs === undefined || typeof c.durationMs === 'number') &&
     (c.turns === undefined || (Array.isArray(c.turns) && c.turns.every(isValidTurn)))

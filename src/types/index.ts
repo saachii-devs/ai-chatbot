@@ -7,11 +7,21 @@ export interface Message {
   createdAt: number
   status: 'sending' | 'sent' | 'failed'
   // The reply stopped short of its own ending. The text is real, just unfinished.
+  // Set both when the user hits Stop and when they talk over a spoken reply.
   truncated?: boolean
-  // 'call' = a marker bubble ("Voice call · 2m 34s"), not a real chat turn.
+
+  // 'call' = the "Voice call · 2m 34s" header a voice session leaves in the
+  // transcript. Everything said during that session follows it as ordinary
+  // user/assistant messages — the marker introduces them, it does not contain
+  // them.
   kind?: 'call'
   durationMs?: number
-  // Only on call markers: the conversation during the call, so it can be expanded.
+
+  // LEGACY — read, never written. Voice used to be a self-contained call whose
+  // whole transcript was nested inside the marker, unfolding on click. It now
+  // writes real messages instead, so nothing fills this any more. It stays so
+  // calls saved by the old build still deserialize and render their transcript
+  // (see MessageBubble.CallMarker). Deleting it silently corrupts that history.
   turns?: CallTurn[]
 }
 
@@ -34,6 +44,11 @@ export interface SessionError {
 export interface SessionsState {
   sessions: ChatSession[]
   activeSessionId: string | null
+  // Ids of deleted chats, newest first. A delete has to be recorded, not
+  // inferred: to another tab, a chat that was deleted and a chat it simply
+  // hasn't seen yet look the same. Ids are random and never reissued, so this
+  // list only has to outlive the tabs that might still hold the session.
+  deletedIds: string[]
   // "Loading" is per-session, not per-app, so a reply in one chat does not
   // freeze the composer in another; more than one can be true at a time.
   loadingSessionIds: string[]
@@ -51,11 +66,16 @@ export type CallStatus =
   | 'connecting'
   | 'connected'
   | 'listening'
+  // Heard you, now generating the reply. The mic stays open (you can still cut
+  // in), but without this the UI would sit on "Say anything!" through the whole
+  // wait, as if nothing had been heard.
+  | 'thinking'
   | 'speaking'
   | 'disconnected'
 
-// One line of the in-call transcript. Lives ONLY in the call overlay; the chat
-// session receives just a duration marker after the call ends.
+// LEGACY, alongside Message.turns — one line of an old call's nested transcript.
+// Nothing writes these now that voice speaks in ordinary messages; kept so old
+// saved sessions still load.
 export interface CallTurn {
   id: string
   role: 'user' | 'assistant'

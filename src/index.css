@@ -22,6 +22,20 @@
   --animate-rise-in: rise-in 280ms cubic-bezier(0.16, 1, 0.3, 1);
   --animate-scale-in: scale-in 200ms cubic-bezier(0.16, 1, 0.3, 1);
 
+  /* A highlight travelling left-to-right across the waiting text. Paired with a
+     200%-wide gradient clipped to the glyphs, so it sweeps the letters
+     themselves rather than a box behind them. */
+  --animate-shimmer: shimmer 2s linear infinite;
+
+  @keyframes shimmer {
+    from {
+      background-position: 150% 0;
+    }
+    to {
+      background-position: -50% 0;
+    }
+  }
+
   /* `steps(1)` snaps on and off like a terminal cursor rather than pulsing. */
   --animate-caret-blink: caret-blink 1s steps(1) infinite;
 

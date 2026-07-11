@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { memo, useEffect, useRef } from 'react'
 
 // Gradient-blue bars over water, driven by whichever AnalyserNode holds the floor
 // (mic while listening, reply audio while speaking); flat and calm when nobody does.
@@ -8,6 +8,53 @@ const BARS = 56
 const ATTACK = 0.45
 const RELEASE = 0.10
 const MIN_HEIGHT = 3
+
+// ── While the ASSISTANT speaks, the bars are FAKED. ──
+//
+// Not laziness — the honest reading is the bad one. TTS is compressed to a
+// near-constant loudness, so its spectrum holds no slow movement at all: it
+// shivers at syllable rate around a fixed level. Every attempt to ease that into
+// something calm just produced a slower shiver at the same height, because there
+// is nothing slow in the signal to follow. Nothing is lost by not showing it —
+// there was no information in it worth reading.
+//
+// So while it talks: one slow BREATH, with an occasional larger swell on top, and
+// a barely-there ripple so the row is not a rigid shape being scaled. Everything
+// below is a continuous function of time — no randomness, no per-frame decision,
+// nothing sampled. There is nothing here that CAN jitter, even in principle.
+//
+// The MIC keeps its real per-bin meter (ATTACK/RELEASE above): there the audio is
+// the user's own, answering them is the whole point, and it must be true.
+
+// Resting height. The row never collapses — the assistant is present for as long
+// as it is talking, and a row that drops to nothing between swells reads as a
+// dropout rather than as breathing.
+const FAKE_FLOOR = 0.3
+// The steady breath, in and out.
+const BREATH_PERIOD_S = 3.4
+const BREATH_DEPTH = 0.17
+// The occasional larger swell that implies a phrase. A slow sine raised to a high
+// power sits near zero MOST of the time and blooms briefly — so swells arrive
+// every several seconds rather than pulsing evenly, which is what separates
+// "speaking" from "a metronome".
+const PULSE_PERIOD_S = 5.1
+const PULSE_SHARPNESS = 6
+const PULSE_DEPTH = 0.34
+// A long, shallow wave along the row. Deliberately small: enough that the bars are
+// not one rigid silhouette, not so much that it becomes a ripple effect.
+const RIPPLE_DEPTH = 0.12
+const RIPPLE_WAVELENGTH = 0.22
+const RIPPLE_PERIOD_S = 4.2
+// Every change is eased, including the handover between the mic's real meter and
+// this — so the row flows from one into the other instead of cutting. Raised
+// alongside the quicker periods above: too slow an ease and the bars lag behind
+// the curves they are meant to be tracing, flattening the swells back out.
+const FAKE_EASE = 0.1
+// The resting silhouette: tallest mid-row, never quite zero at the ends.
+const FAKE_ARCH_FLOOR = 0.45
+const FAKE_ARCH_EXPONENT = 0.9
+
+const TWO_PI = Math.PI * 2
 
 // Two thresholds (hysteresis) so the flag doesn't chatter around one edge; the hold keeps
 // it up across silent gaps between words. Set high enough that room tone never raises it —
@@ -42,7 +89,7 @@ const WAVE_STEP = 3
 /** How hard the crests are dissolved. Large enough that no layer has an edge. */
 const WAVE_BLUR = 14
 
-export default function Visualizer({
+function Visualizer({
   getAnalyser,
   listening,
   speaking,
@@ -55,12 +102,19 @@ export default function Visualizer({
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   // Read inside the animation frame, so toggling them never restarts the loop.
+  // EVERY prop goes through a ref, without exception — including the callbacks.
+  // The loop owns `levels`, the eased bar heights, and that state only exists
+  // between frames: restarting the effect zeroes it, and the bars can never climb
+  // above one ease step off the floor. A single unmemoised prop is enough to do
+  // that on every render, which is exactly what happened here.
   const listeningRef = useRef(listening)
   listeningRef.current = listening
   const speakingRef = useRef(speaking)
   speakingRef.current = speaking
   const onSpeakingChangeRef = useRef(onSpeakingChange)
   onSpeakingChangeRef.current = onSpeakingChange
+  const getAnalyserRef = useRef(getAnalyser)
+  getAnalyserRef.current = getAnalyser
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -70,6 +124,14 @@ export default function Visualizer({
 
     const data = new Uint8Array(128) // fftSize 256 -> 128 frequency bins
     const levels = new Float32Array(BARS)
+
+    // The faked row's resting silhouette, computed once.
+    const fakeArch = new Float32Array(BARS)
+    for (let i = 0; i < BARS; i++) {
+      const arch = Math.pow(Math.sin((i / (BARS - 1)) * Math.PI), FAKE_ARCH_EXPONENT)
+      fakeArch[i] = FAKE_ARCH_FLOOR + (1 - FAKE_ARCH_FLOOR) * arch
+    }
+
     let raf = 0
     let userSpeaking = false
     let quietSince = 0
@@ -123,18 +185,55 @@ export default function Visualizer({
       const { width, height } = canvas
       ctx.clearRect(0, 0, width, height)
 
-      // Sample only while someone holds the floor; else every bar targets zero and eases down.
-      const hasFloor = listeningRef.current || speakingRef.current
-      const analyser = hasFloor ? getAnalyser() : null
+      // The assistant is talking: don't read the audio at all, animate instead.
+      const isSpeaking = speakingRef.current
+
+      // Sample only while the MIC holds the floor; else every bar targets zero and eases down.
+      const analyser =
+        !isSpeaking && listeningRef.current ? getAnalyserRef.current() : null
       if (analyser) analyser.getByteFrequencyData(data)
+
+      // The whole faked row rides ONE amplitude, so every bar rises and falls
+      // together — that togetherness is what makes it read as breathing rather
+      // than as 56 bars each doing their own thing. Computed once per frame, not
+      // per bar.
+      const seconds = stillWater ? 0 : now / 1000
+      let breathAmplitude = 0
+      if (isSpeaking) {
+        // The steady breath: a plain slow sine, in 0..1.
+        const breath = 0.5 + 0.5 * Math.sin((seconds / BREATH_PERIOD_S) * TWO_PI)
+        // The occasional swell: near zero most of the time, blooming briefly. The
+        // power is what makes it occasional — an unraised sine would just pulse.
+        const swell = Math.pow(
+          0.5 + 0.5 * Math.sin((seconds / PULSE_PERIOD_S) * TWO_PI),
+          PULSE_SHARPNESS,
+        )
+        breathAmplitude = FAKE_FLOOR + BREATH_DEPTH * breath + PULSE_DEPTH * swell
+      }
 
       // Ease every bar before painting: the swell is a function of the mean, so it can't be
       // computed inside the drawing loop without lagging the bars a frame.
       let sum = 0
       for (let i = 0; i < BARS; i++) {
-        // Voice energy lives in the lower half of the spectrum.
-        const target = analyser ? data[Math.floor((i / BARS) * (data.length / 2))] / 255 : 0
-        const ease = target > levels[i] ? ATTACK : RELEASE
+        let target: number
+        let ease: number
+
+        if (isSpeaking) {
+          // The shared amplitude, wearing the arch, with a long shallow wave
+          // travelling through so the row is alive rather than a scaled shape.
+          const ripple =
+            1 +
+            RIPPLE_DEPTH *
+              Math.sin(i * RIPPLE_WAVELENGTH - (seconds / RIPPLE_PERIOD_S) * TWO_PI)
+          target = Math.min(1, breathAmplitude * fakeArch[i] * ripple)
+          ease = FAKE_EASE
+        } else {
+          // The user's voice, read for real. Voice energy lives in the lower half
+          // of the spectrum.
+          target = analyser ? data[Math.floor((i / BARS) * (data.length / 2))] / 255 : 0
+          ease = target > levels[i] ? ATTACK : RELEASE
+        }
+
         levels[i] += (target - levels[i]) * ease
         sum += levels[i]
       }
@@ -193,7 +292,10 @@ export default function Visualizer({
     // Scheduled, not called: draw takes the frame timestamp; calling it by hand passes undefined.
     raf = requestAnimationFrame(draw)
     return () => cancelAnimationFrame(raf)
-  }, [getAnalyser])
+    // EMPTY, and it must stay empty. Everything this loop reads is behind a ref
+    // above, precisely so nothing can list a dependency here — a re-run cancels
+    // the loop and throws away the animation's accumulated state.
+  }, [])
 
   return (
     <canvas
@@ -205,3 +307,8 @@ export default function Visualizer({
     />
   )
 }
+
+// The caption updates state ~60×/second while the assistant speaks, re-rendering
+// VoicePanel every frame. None of that concerns the canvas — it paints itself from
+// its own loop — so keep the re-renders from reaching it at all.
+export default memo(Visualizer)

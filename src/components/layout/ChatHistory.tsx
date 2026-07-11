@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { abortSession } from '../../hooks/useChat'
+import { abortSession } from '../../services/inFlight'
 import { useSessions } from '../../state/SessionsContext'
 import type { ChatSession } from '../../types'
 import { formatRelativeTime } from '../../utils/formatRelativeTime'

@@ -1,7 +1,14 @@
 import { useState, type ReactNode } from 'react'
-import { RAIL_WIDTH } from '../../utils/breakpoints'
+import { RAIL_COLLAPSED_WIDTH, RAIL_WIDTH } from '../../utils/breakpoints'
 import { cn } from '../../utils/cn'
-import { ChevronLeftIcon, PencilIcon, SearchIcon, SparkleLogo, XIcon } from '../icons'
+import {
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  PencilIcon,
+  SearchIcon,
+  SparkleLogo,
+  XIcon,
+} from '../icons'
 import Button from '../ui/Button'
 import Tooltip from '../ui/Tooltip'
 import ChatHistory from './ChatHistory'
@@ -34,11 +41,16 @@ function RailButton({
 }
 
 export default function IconRail({
+  collapsed,
   onNewChat,
+  onOpen,
   onClose,
   onNavigate,
 }: {
+  /** Icons-only rail. Desktop only — a drawer is either open or gone. */
+  collapsed: boolean
   onNewChat: () => void
+  onOpen: () => void
   onClose: () => void
   /** Fired whenever the rail takes you somewhere: a chat, or a new chat. */
   onNavigate: () => void
@@ -55,6 +67,71 @@ export default function IconRail({
   const navigate = () => {
     closeSearch()
     onNavigate()
+  }
+
+  if (collapsed) {
+    return (
+      <div
+        className={cn(
+          'flex h-full shrink-0 flex-col items-center gap-1 py-3',
+          RAIL_COLLAPSED_WIDTH,
+        )}
+      >
+        {/* Labels sit beside the icons, not beneath: every one of them is wider
+            than the 4rem column they would have to fit in. */}
+        <Tooltip label="Open sidebar" side="right">
+          <Button
+            variant="bare"
+            size="iconLg"
+            onClick={onOpen}
+            aria-label="Open sidebar"
+            aria-expanded={false}
+            className="group/logo mb-3"
+          >
+            {/* At rest it is the mark; under the cursor it becomes the control it
+                actually is. Both are stacked and cross-faded rather than swapped
+                on a condition — a mid-fade unmount would flicker. Neither is in
+                flow (the button is already icon-sized), so the box never moves. */}
+            <SparkleLogo className="size-7 transition-opacity duration-150 ease-out group-hover/logo:opacity-0 group-focus-visible/logo:opacity-0" />
+            <ChevronRightIcon
+              aria-hidden="true"
+              className="absolute opacity-0 transition-opacity duration-150 ease-out group-hover/logo:opacity-100 group-focus-visible/logo:opacity-100"
+            />
+          </Button>
+        </Tooltip>
+
+        {/* New chat does not expand the rail: the point of the collapsed rail is
+            reaching these two without giving up the width. */}
+        <Tooltip label="New chat" side="right">
+          <Button
+            variant="subtle"
+            size="iconLg"
+            onClick={() => {
+              navigate()
+              onNewChat()
+            }}
+            aria-label="New chat"
+          >
+            <PencilIcon className="size-5" />
+          </Button>
+        </Tooltip>
+
+        {/* Search does, though — there is nowhere to put the field or its results. */}
+        <Tooltip label="Search chats" side="right">
+          <Button
+            variant="subtle"
+            size="iconLg"
+            onClick={() => {
+              setSearchOpen(true)
+              onOpen()
+            }}
+            aria-label="Search chats"
+          >
+            <SearchIcon className="size-5" />
+          </Button>
+        </Tooltip>
+      </div>
+    )
   }
 
   return (
