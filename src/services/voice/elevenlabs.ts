@@ -6,11 +6,14 @@ import {
   type VoiceEventHandlers,
   type VoiceService,
 } from '../voiceService'
+import { createBargeInDetector, type BargeInDetector } from './bargeIn'
 import { watchMicTrack } from './micTrack'
 
 // ElevenLabs VoiceService: STT over the Scribe realtime WebSocket (raw PCM as
 // base64 JSON, authed with a single-use REST token — socket rejects raw keys);
-// TTS via one REST call returning MP3 played through <audio>. No barge-in here.
+// TTS via one REST call returning MP3 played through <audio>. Barge-in via the
+// shared mic detector, which is the only thing that can hear the user while the
+// reply is playing — the socket cannot, by design (see `speaking` below).
 
 // Sample rates the realtime API accepts as pcm_<rate>:
 const SUPPORTED_RATES = [8000, 16000, 22050, 24000, 44100, 48000]
@@ -38,12 +41,30 @@ const RECONNECT_BASE_MS = 500
 // assistant, arriving late.
 const MIC_REOPEN_DELAY_MS = 400
 
+// An interruption is only RECOGNISED once it has been going for a few hundred
+// milliseconds — that is what tells a voice apart from a dropped pen. But by then
+// the user is already a word into their sentence, and every buffer we spent
+// deciding went up the socket as silence. So while the gate is shut, keep the real
+// audio too: on a barge-in it is replayed, and Scribe hears the sentence from its
+// first syllable instead of joining it halfway through.
+//
+// Bounded ABOVE as well as below, and that is the subtle half. This is sized to
+// cover the detection delay and no more. Reach back any further and the audio being
+// flushed is from a time when only the ASSISTANT was talking — so we would be
+// handing Scribe a clean recording of the assistant's own voice and inviting it to
+// transcribe it as something the user said. That is the phantom-utterance bug the
+// mute gate exists to prevent, coming back in through a side door.
+const BARGE_PREROLL_SECONDS = 0.5
+
 export class ElevenLabsVoiceService implements VoiceService {
   private readonly config: VoiceConfig
   private readonly tokenUrl: string
   private readonly sttUrl: string
   private readonly ttsUrl: string
 
+  // Held as a field, not just closed over in startListening, because the barge-in
+  // detector fires from a timer that has no other way back to the caller.
+  private handlers: VoiceEventHandlers | null = null
   private socket: WebSocket | null = null
   private mediaStream: MediaStream | null = null
   private audioContext: AudioContext | null = null
@@ -84,6 +105,17 @@ export class ElevenLabsVoiceService implements VoiceService {
   // the last few words come back as a phantom utterance.
   private muteUntilMs = 0
 
+  // The user took the floor back mid-reply. Latched for the rest of the turn: it
+  // is what tells speak()'s unwind that the mic must NOT be gated on the way out
+  // (see the reopen delay there), and it stops a second detection landing while
+  // the first is still tearing the reply down.
+  private bargedIn = false
+  private detector: BargeInDetector | null = null
+  // What the mic heard while the gate was shut, kept in case it turns out to have
+  // been someone interrupting. See BARGE_PREROLL_SECONDS.
+  private bargePreroll: Int16Array[] = []
+  private bargePrerollLimit = 0
+
   private micIsMuted(): boolean {
     return this.speaking || Date.now() < this.muteUntilMs
   }
@@ -114,8 +146,10 @@ export class ElevenLabsVoiceService implements VoiceService {
     if (!this.isSupported()) throw new VoiceServiceError('unsupported')
     const apiKey = this.config.apiKey
     if (!apiKey) throw new VoiceServiceError('missing_key')
+    this.handlers = handlers
     this.closing = false
     this.reconnectAttempts = 0
+    this.bargedIn = false
 
     // Mic first, so a denial opens nothing else. autoGainControl off: else a
     // quiet room's gain winds up until room tone reads as loud as a voice.
@@ -283,6 +317,14 @@ export class ElevenLabsVoiceService implements VoiceService {
     const bufferSeconds = BUFFER_FRAMES / ctx.sampleRate
     this.hangoverBuffers = Math.ceil(NOISE_GATE_HANGOVER_SECONDS / bufferSeconds)
     this.prerollLimit = Math.ceil(NOISE_GATE_PREROLL_SECONDS / bufferSeconds)
+    this.bargePrerollLimit = Math.max(1, Math.ceil(BARGE_PREROLL_SECONDS / bufferSeconds))
+
+    // Taps the mic source directly — the ONE path into this service that is still
+    // open while the reply is playing, since everything the socket would have
+    // carried is being replaced with silence below.
+    this.detector = createBargeInDetector(this.source, this.config, () =>
+      this.onBargeInDetected(),
+    )
 
     this.processor = ctx.createScriptProcessor(BUFFER_FRAMES, 1, 1)
     this.processor.onaudioprocess = (e) => {
@@ -293,8 +335,13 @@ export class ElevenLabsVoiceService implements VoiceService {
       // the messages alone is not enough — the server's VAD would still be
       // building an utterance out of the assistant's voice, and would commit it
       // the moment the gate reopened. Silence keeps the VAD's picture honest.
+      //
+      // But KEEP what we are not sending. The detector needs a few hundred ms of
+      // someone talking before it will believe them, and those are the buffers
+      // holding the front of their sentence.
       if (this.micIsMuted()) {
         this.resetNoiseGate()
+        this.rememberBargePreroll(toPcm(floats))
         this.send(new Int16Array(floats.length))
         return
       }
@@ -378,6 +425,36 @@ export class ElevenLabsVoiceService implements VoiceService {
     this.preroll.length = 0
   }
 
+  // Someone is talking over the reply, and the detector is satisfied they are a
+  // someone. Take the floor off the assistant and give it back to them.
+  private onBargeInDetected(): void {
+    if (this.bargedIn || !this.speaking) return
+    this.bargedIn = true
+    this.detector?.disarm()
+
+    // Silence the assistant BEFORE opening the mic, not after. onBargeIn runs the
+    // caller's interrupt synchronously — abort the TTS signal, pause the <audio> —
+    // so by the time the flags below drop, there is nothing left coming out of the
+    // speakers for the transcriber to mistake for the user.
+    this.handlers?.onBargeIn()
+
+    // Now let the mic through. Not via muteUntilMs's usual tail: that delay exists
+    // to swallow the assistant's last moments, and here it would swallow the user's
+    // first ones instead.
+    this.speaking = false
+    this.muteUntilMs = 0
+
+    // And hand over what they said while we were still making up our mind.
+    for (const buffered of this.bargePreroll) this.send(buffered)
+    this.bargePreroll.length = 0
+  }
+
+  // The last BARGE_PREROLL_SECONDS of what the mic heard while the gate was shut.
+  private rememberBargePreroll(pcm: Int16Array): void {
+    this.bargePreroll.push(pcm)
+    if (this.bargePreroll.length > this.bargePrerollLimit) this.bargePreroll.shift()
+  }
+
   stopListening(): void {
     // Set BEFORE closing the socket, or onclose reads the hang-up as a drop
     // and reconnects the call the user just ended.
@@ -387,6 +464,13 @@ export class ElevenLabsVoiceService implements VoiceService {
     window.clearTimeout(this.reconnectTimer)
     this.reconnectTimer = undefined
     this.reconnectAttempts = 0
+
+    // Its interval and its analyser would otherwise outlive the mic they are
+    // attached to.
+    this.detector?.dispose()
+    this.detector = null
+    this.bargedIn = false
+    this.bargePreroll.length = 0
 
     // Before the tracks are stopped below: stopping one fires 'ended', which
     // would report our own hang-up as the mic being snatched away.
@@ -418,6 +502,7 @@ export class ElevenLabsVoiceService implements VoiceService {
       this.socket.close()
     }
     this.socket = null
+    this.handlers = null
   }
 
   async speak(
@@ -470,6 +555,11 @@ export class ElevenLabsVoiceService implements VoiceService {
       // Set BEFORE play(), or the first syllable is already on its way up the
       // socket by the time the flag lands.
       this.speaking = true
+      // The mic is shut to the SOCKET, not to us: the analyser still hears the
+      // room, and the detector is what listens for the user through the reply.
+      this.bargedIn = false
+      this.bargePreroll.length = 0
+      this.detector?.arm()
 
       // play() rejects either because we paused (hang-up/barge-in, expected) or
       // the browser refused a sound (autoplay); distinguished below, not swallowed.
@@ -533,12 +623,18 @@ export class ElevenLabsVoiceService implements VoiceService {
     } catch (err) {
       throw err instanceof VoiceServiceError ? err : new VoiceServiceError('tts_failed')
     } finally {
+      this.detector?.disarm()
+      this.speaking = false
       // Reopen the mic, but not instantly: audio captured while it was still
       // talking is already in flight up the socket, and the room's reverb lags
       // the speaker. Reopening on the same tick lets that tail come back as a
       // phantom utterance — the very thing this gate exists to stop.
-      this.speaking = false
-      this.muteUntilMs = Date.now() + MIC_REOPEN_DELAY_MS
+      //
+      // Unless we were interrupted. Then the mic is ALREADY open (onBargeInDetected
+      // opened it, and has been feeding the socket for a moment) and the user is
+      // mid-sentence — so re-shutting it for 400ms here would cut a hole in the
+      // middle of the very utterance we stopped talking in order to hear.
+      this.muteUntilMs = this.bargedIn ? 0 : Date.now() + MIC_REOPEN_DELAY_MS
 
       // The frame loop outlives the promise on every exit path — abort, error,
       // end — and would otherwise run for the life of the tab, driving a caption

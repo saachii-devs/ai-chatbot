@@ -6,20 +6,13 @@ import {
   type VoiceEventHandlers,
   type VoiceService,
 } from '../voiceService'
+import { createBargeInDetector, type BargeInDetector } from './bargeIn'
 import { watchMicTrack } from './micTrack'
 
 // Browser-native VoiceService: SpeechRecognition (STT) + speechSynthesis (TTS),
-// Chrome/Edge only (else 'unsupported'). Barge-in via an RMS mic meter; drop
-// transcripts while speaking, else Chrome transcribes the assistant's own voice.
-
-// How loud you must be to take the floor back from the assistant. Low, so a
-// quiet voice can still interrupt — the hold below is what keeps room tone from
-// tripping it, rather than a high bar that only a raised voice clears.
-const BARGE_IN_RMS = 0.015
-// Sustained for this long, so a cough or a keyboard tap is not an interruption.
-// Lengthened alongside the lower threshold: the two together are the filter.
-const BARGE_IN_SECONDS = 0.3
-const METER_INTERVAL_MS = 50
+// Chrome/Edge only (else 'unsupported'). Barge-in via the shared mic detector;
+// drop transcripts while speaking, else Chrome transcribes the assistant's own
+// voice.
 
 // Chrome silently pauses synthesis after ~15s; poke resume() on a timer.
 const SYNTH_KEEPALIVE_MS = 10_000
@@ -62,7 +55,6 @@ function recognitionCtor(): RecognitionCtor | null {
 export class BrowserVoiceService implements VoiceService {
   private readonly config: VoiceConfig
 
-  private handlers: VoiceEventHandlers | null = null
   private recognition: Recognition | null = null
   private listening = false
   private opened = false
@@ -74,8 +66,7 @@ export class BrowserVoiceService implements VoiceService {
 
   private speaking = false
   private bargedIn = false
-  private hotTicks = 0
-  private meterTimer: number | undefined
+  private detector: BargeInDetector | null = null
   private keepaliveTimer: number | undefined
   private unwatchMic: (() => void) | null = null
 
@@ -83,7 +74,7 @@ export class BrowserVoiceService implements VoiceService {
     this.config = config
   }
 
-  // Speech recognition is Chrome/Edge only, and the RMS barge-in meter needs a
+  // Speech recognition is Chrome/Edge only, and the barge-in detector needs a
   // mic and an audio graph. Firefox and Safari have neither recogniser.
   isSupported(): boolean {
     return hasMicAndAudio() && recognitionCtor() !== null && 'speechSynthesis' in window
@@ -95,7 +86,6 @@ export class BrowserVoiceService implements VoiceService {
     if (!this.isSupported()) throw new VoiceServiceError('unsupported')
     const Ctor = recognitionCtor()
     if (!Ctor) throw new VoiceServiceError('unsupported')
-    this.handlers = handlers
     this.listening = true
     this.opened = false
 
@@ -125,6 +115,16 @@ export class BrowserVoiceService implements VoiceService {
     // 4kHz for the visualizer's 56 bars. See the note on FREQ_MIN in Visualizer.
     this.micAnalyser.fftSize = 1024
     this.source.connect(this.micAnalyser)
+
+    // No preroll to replay here, unlike the hosted provider: Chrome's recogniser
+    // owns its own audio stream and never stopped listening, so it already heard
+    // the start of the interrupting sentence. All that was ever being withheld was
+    // the RESULT — which the flag below stops withholding.
+    this.detector = createBargeInDetector(this.source, this.config, () => {
+      if (this.bargedIn || !this.speaking) return
+      this.bargedIn = true // stops onresult discarding what they say next
+      handlers.onBargeIn()
+    })
 
     const recognition = new Ctor()
     this.recognition = recognition
@@ -185,46 +185,15 @@ export class BrowserVoiceService implements VoiceService {
     }
 
     recognition.start()
-    this.startMeter()
-  }
-
-  // Watch the mic for a human talking over the assistant.
-  private startMeter(): void {
-    const analyser = this.micAnalyser
-    if (!analyser) return
-    const samples = new Uint8Array(analyser.fftSize)
-    const ticksNeeded = Math.max(1, Math.ceil((BARGE_IN_SECONDS * 1000) / METER_INTERVAL_MS))
-
-    this.meterTimer = window.setInterval(() => {
-      if (!this.speaking || this.bargedIn) {
-        this.hotTicks = 0
-        return
-      }
-      analyser.getByteTimeDomainData(samples)
-      let sumSquares = 0
-      for (let i = 0; i < samples.length; i++) {
-        const centred = (samples[i] - 128) / 128 // bytes centred on 128
-        sumSquares += centred * centred
-      }
-      const rms = Math.sqrt(sumSquares / samples.length)
-      this.hotTicks = rms > BARGE_IN_RMS ? this.hotTicks + 1 : 0
-
-      if (this.hotTicks >= ticksNeeded) {
-        this.bargedIn = true
-        this.hotTicks = 0
-        this.handlers?.onBargeIn()
-      }
-    }, METER_INTERVAL_MS)
   }
 
   stopListening(): void {
     this.listening = false
     this.speaking = false
     this.bargedIn = false
-    this.hotTicks = 0
 
-    window.clearInterval(this.meterTimer)
-    this.meterTimer = undefined
+    this.detector?.dispose()
+    this.detector = null
     window.clearInterval(this.keepaliveTimer)
     this.keepaliveTimer = undefined
 
@@ -253,7 +222,6 @@ export class BrowserVoiceService implements VoiceService {
     this.audioContext = null
     this.mediaStream?.getTracks().forEach((t) => t.stop()) // kills the recording dot
     this.mediaStream = null
-    this.handlers = null
   }
 
   async speak(
@@ -283,7 +251,7 @@ export class BrowserVoiceService implements VoiceService {
 
     this.speaking = true
     this.bargedIn = false
-    this.hotTicks = 0
+    this.detector?.arm()
     // Chrome's >15s pause bug (see constant above).
     this.keepaliveTimer = window.setInterval(() => {
       if (synth.speaking) synth.resume()
@@ -317,8 +285,8 @@ export class BrowserVoiceService implements VoiceService {
     } finally {
       window.clearInterval(this.keepaliveTimer)
       this.keepaliveTimer = undefined
+      this.detector?.disarm()
       this.speaking = false
-      this.hotTicks = 0
       synth.cancel() // nothing may outlive this turn
     }
   }

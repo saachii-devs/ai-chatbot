@@ -68,6 +68,58 @@ export const env = {
     // — a failure they cannot diagnose. Too low merely sends some room tone,
     // which the transcriber discards. Err on the side of hearing.
     noiseGateRms: level(import.meta.env.VITE_VOICE_NOISE_GATE_RMS, 0.012),
+
+    // --- Barge-in: taking the floor back while the assistant is still talking.
+    //
+    // Three tests have to agree before a reply is cut off, because the three
+    // things that must NOT cut it off each defeat a different one on its own:
+    // a desk tap is loud (defeats level), the assistant's own echo is speech
+    // (defeats the spectrum), and a cough is both (defeats everything but time).
+
+    // Note the bias here runs OPPOSITE to noiseGateRms above, deliberately. That
+    // gate errs on the side of hearing, because a soft speaker who is never
+    // transcribed cannot work out why. These err on the side of NOT firing,
+    // because cutting a reply off for a dropped pen is just as undiagnosable —
+    // and unlike a missed word, the user cannot fix it by repeating themselves.
+
+    // How loud you must be — measured in the 200-5000Hz SPEECH BAND, not across the
+    // whole waveform, so the number means the same thing for a deep voice and a
+    // high one. (It did not always: broadband RMS is dominated by low frequencies,
+    // so the same bar that one person cleared by talking, another could only clear
+    // by shouting. See VOICE_LOW_HZ in voice/bargeIn.ts.) Band-limited levels run
+    // lower than broadband ones, which is why this sits below where it started.
+    //
+    // A FLOOR, not the whole bar: the detector measures the assistant's own echo at
+    // the top of every reply and stands the bar above that, so this only has to
+    // clear a quiet room. 0 turns barge-in off entirely and restores the old
+    // wait-your-turn behaviour.
+    bargeInRms: level(import.meta.env.VITE_VOICE_BARGE_IN_RMS, 0.015),
+    // ...and this many times louder than the echo it measured. The ONLY defence
+    // against the assistant interrupting itself: its voice coming back through the
+    // speakers is sustained, and it is speech in the voice band, so neither the
+    // hold nor the ratio below can tell it from a human — only its level can.
+    // Raise this if the assistant cuts itself off (loud speakers, or an output
+    // device the browser's echo canceller cannot see, like an HDMI monitor).
+    bargeInFloorMultiplier: num(import.meta.env.VITE_VOICE_BARGE_IN_FLOOR_MULT, 3),
+    // ...but never demand more than this, however bad the echo is. A ceiling, and
+    // the reason it exists is a failure we actually hit: with a badly-cancelled
+    // echo the bar above climbs past anything a human throat can produce, and the
+    // user is simply locked out of interrupting — which does not present as a
+    // threshold that needs tuning, it presents as a broken feature, and no amount
+    // of speaking louder fixes it. If the echo really is as loud as a voice then
+    // the two cannot be told apart, and it is better to occasionally clip the
+    // assistant than to silently take interruption away altogether.
+    bargeInMaxRms: level(import.meta.env.VITE_VOICE_BARGE_IN_MAX_RMS, 0.05),
+    // ...for this long, sustained. THE filter against impulses: a tap, a click, a
+    // dropped pen are all over in 20-80ms, so no threshold separates them from a
+    // voice by loudness — only by lasting. ~300ms is about one syllable. It is
+    // also the latency budget: the reply goes quiet this long after you start.
+    bargeInHoldMs: num(import.meta.env.VITE_VOICE_BARGE_IN_HOLD_MS, 300),
+    // ...and shaped like a voice: this much of the sound's power must fall in the
+    // speech band (300-3400Hz). This is what catches the noise that IS sustained —
+    // a desk knock carries through the desk as a low thump, typing is a train of
+    // high clicks, and neither puts its energy where a voice puts it.
+    bargeInVoiceRatio: level(import.meta.env.VITE_VOICE_BARGE_IN_VOICE_RATIO, 0.55),
   },
 } as const
 

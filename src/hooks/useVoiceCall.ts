@@ -46,18 +46,12 @@ const FIRST_TOKEN_TIMEOUT_MS = 35_000
 // letting the user keep talking into a void is worse than telling them.
 const MAX_CONSECUTIVE_TTS_FAILURES = 2
 
-// Barge-in has to be judged on PARTIAL transcripts, not committed ones, and the
-// reason is a hard constraint rather than a preference: the transcriber only commits
-// at end-of-utterance, and on the hosted provider the mic is gated shut the moment
-// the reply becomes audible. So an interruption that waits for the commit arrives
-// after the mute has already swallowed it — i.e. never. It has to be recognised
-// WHILE the user is still mid-sentence.
-//
-// But a single partial frame is just sound, and acting on one is what let a cough
-// kill a reply. So: two bars, and an interruption clears both while noise clears
-// neither.
-const BARGE_IN_MIN_CHARS = 8 // "uh", "mm", a throat-clear — not an interruption
-const BARGE_IN_MIN_PARTIALS = 2 // ...and neither is one isolated frame of anything
+// An interruption cannot be judged from transcripts at all, and that is what the
+// providers' barge-in detectors are for. The transcriber only commits at
+// end-of-utterance, and on the hosted provider the mic is gated shut the moment the
+// reply becomes audible — so an interruption that waits for a commit arrives after
+// the mute has already swallowed it, i.e. never. It has to be heard as SOUND, by a
+// meter on the mic, while the user is still mid-sentence. See voice/bargeIn.ts.
 
 let callActive = false
 let processingTurn = false
@@ -392,6 +386,17 @@ export function useVoiceCall() {
     setLiveTranscript('')
     clearSpoken() // the assistant was cut off mid-sentence; its caption goes too
     setStatus('listening')
+    // runTurn disarmed the silence timer when it took the floor, and settleTurn —
+    // which would normally re-arm it — is skipped for an interrupted turn, because
+    // interrupt() just bumped the generation out from under it. So this call is the
+    // only thing left to re-arm it.
+    //
+    // It matters because a barge-in can now be raised by a MICROPHONE rather than
+    // by a finished sentence. A committed utterance always brings the next turn
+    // with it; a meter can be fooled, and when it is, nothing arrives at all — and
+    // a call whose idle timeouts were disarmed by the turn it just killed would sit
+    // there listening to an empty room until the tab closed.
+    armSilence(() => failCall(new VoiceServiceError('no_speech')))
   }
 
   // The floor is back with the mic: the assistant's caption goes with it.
