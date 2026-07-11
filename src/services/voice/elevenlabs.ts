@@ -444,14 +444,23 @@ export class ElevenLabsVoiceService implements VoiceService {
     }
     if (!response.ok) throw new VoiceServiceError('tts_failed')
 
-    const blob = await response.blob()
-    const url = URL.createObjectURL(blob)
-    const audio = new Audio(url)
-    // Held outside the try so `finally` can tear the graph down on any exit.
+    // The body read can fail on its own (the connection drops mid-download), and it
+    // has to happen INSIDE the try: out here its raw DOMException would escape as
+    // something other than a VoiceServiceError, and the blob URL minted on the next
+    // line would never reach the revoke in `finally`.
+    // Held outside the try so `finally` can tear the graph down on any exit — and
+    // so both survive a throw from the body read itself.
+    let url = ''
+    let element: HTMLAudioElement | null = null
     let disconnectAnalyser: (() => void) | null = null
     let progressRaf = 0
     try {
-      // Hang-up can land in either await above; bail before making a sound.
+      const blob = await response.blob()
+      url = URL.createObjectURL(blob)
+      const audio = new Audio(url)
+      element = audio
+
+      // Hang-up can land in any await above; bail before making a sound.
       if (signal?.aborted) return
 
       this.audio = audio
@@ -538,10 +547,10 @@ export class ElevenLabsVoiceService implements VoiceService {
       disconnectAnalyser?.()
       // Only if we still own the element: an interruption starts the next turn
       // before this unwinds, and clobbering its audio would mute that reply.
-      if (this.audio === audio) {
+      if (element && this.audio === element) {
         this.audio = null
       }
-      URL.revokeObjectURL(url) // blob URLs leak until revoked
+      if (url) URL.revokeObjectURL(url) // blob URLs leak until revoked
     }
   }
 

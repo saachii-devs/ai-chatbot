@@ -25,8 +25,39 @@ import { useChat } from './useChat'
 const NO_SPEECH_TIMEOUT_MS = 20_000
 // A gap after a real exchange. Longer, because a pause to think is not an empty room.
 const IDLE_SILENCE_TIMEOUT_MS = 30_000
-// The model is taking longer than we are willing to hold the mic open for.
-const REPLY_TIMEOUT_MS = 20_000
+
+// How long we wait for the model's FIRST token — not for the whole reply. It is
+// disarmed the moment text starts arriving, so a long answer streams for as long
+// as it needs to; only a model that never STARTS is a hung one.
+//
+// This used to wrap the entire send, which meant a perfectly healthy reply that
+// took more than 20s to stream was guillotined mid-sentence: the call hung up and
+// the half-finished text was left sitting in the chat, never spoken. That is the
+// bug this constant's meaning change fixes.
+//
+// Deliberately ABOVE the chat service's own FIRST_TOKEN_TIMEOUT_MS (30s). Whoever
+// fires first writes the error the user reads, and the service's is the better one
+// — it knows why. This is only the backstop for a send that wedges without even
+// reaching the network.
+const FIRST_TOKEN_TIMEOUT_MS = 35_000
+
+// A dead TTS key (or a bad voice id) silences EVERY turn identically. One failure
+// is bad luck and the run goes on; a second in a row is a broken configuration, and
+// letting the user keep talking into a void is worse than telling them.
+const MAX_CONSECUTIVE_TTS_FAILURES = 2
+
+// Barge-in has to be judged on PARTIAL transcripts, not committed ones, and the
+// reason is a hard constraint rather than a preference: the transcriber only commits
+// at end-of-utterance, and on the hosted provider the mic is gated shut the moment
+// the reply becomes audible. So an interruption that waits for the commit arrives
+// after the mute has already swallowed it — i.e. never. It has to be recognised
+// WHILE the user is still mid-sentence.
+//
+// But a single partial frame is just sound, and acting on one is what let a cough
+// kill a reply. So: two bars, and an interruption clears both while noise clears
+// neither.
+const BARGE_IN_MIN_CHARS = 8 // "uh", "mm", a throat-clear — not an interruption
+const BARGE_IN_MIN_PARTIALS = 2 // ...and neither is one isolated frame of anything
 
 let callActive = false
 let processingTurn = false
@@ -59,6 +90,8 @@ let callStartedAtMs: number | null = null
 
 // Has anything at all been said? Decides which silence timeout applies.
 let hasSpoken = false
+// Consecutive turns whose reply could not be spoken. Reset by any turn that is.
+let ttsFailures = 0
 // onOpen fires again after a transport reconnect. A reconnect is not a new call:
 // re-chiming would announce a drop the user never noticed.
 let connectedOnce = false
@@ -76,7 +109,12 @@ let queue: Promise<void> = Promise.resolve()
 // ONCE, at startCall, so anything they close over is frozen for the whole run —
 // reading a render-old `state` would resend a stale history and create a second
 // session on the next turn.
-let latestSend: ((text: string) => Promise<string | null>) | null = null
+let latestSend:
+  | ((
+      text: string,
+      opts?: { sessionId?: string; onChunk?: (chunk: string) => void },
+    ) => Promise<string | null>)
+  | null = null
 let latestActiveSessionId: string | null = null
 let latestDispatch: Dispatch<SessionsAction> | null = null
 
@@ -166,9 +204,15 @@ async function openMarker(): Promise<void> {
     }
     dispatch({ type: 'SESSION_CREATED', session })
     sessionId = session.id
-    boundSessionId = sessionId
-    adoptNextSession = false
   }
+
+  // Bind unconditionally. The create branch above used to be the only place this
+  // was set, so a run that fell through to `latestActiveSessionId` picked a session
+  // to write into and then stayed UNBOUND — leaving finalizeMarker with nowhere to
+  // stamp the duration, and the turn's send with no id to be told. From here on,
+  // "the session this call is in" has exactly one answer.
+  boundSessionId = sessionId
+  adoptNextSession = false
 
   const id = uuid()
   const marker: Message = {
@@ -256,6 +300,7 @@ export function teardown(): void {
   hasSpoken = false
   connectedOnce = false
   lastFinalText = ''
+  ttsFailures = 0
   processingTurn = false
   queue = Promise.resolve()
 
@@ -376,6 +421,10 @@ export function useVoiceCall() {
 
     processingTurn = true
     hasSpoken = true
+    // A previous turn's "couldn't speak that" has been read by now — and leaving it
+    // under the caption of the thing they just said reads as a complaint about THIS
+    // turn, which has not failed at anything yet.
+    setError(null)
     // The AI has the floor; silence is expected until it hands it back.
     disarmSilence()
     // Keep what was just said ON SCREEN while the reply is being generated. It
@@ -399,17 +448,33 @@ export function useVoiceCall() {
       if (!current()) return
     }
 
+    // Watches for the model STARTING, not finishing. Disarmed by the first token
+    // below, so a long answer is free to take as long as it takes — the chat
+    // service's own stall timer is what bounds it, exactly as for a typed message.
+    const disarmFirstToken = () => {
+      window.clearTimeout(replyTimer)
+      replyTimer = undefined
+    }
     window.clearTimeout(replyTimer)
     replyTimer = window.setTimeout(() => {
       if (current()) failCall(new VoiceServiceError('reply_timeout'))
-    }, REPLY_TIMEOUT_MS)
+    }, FIRST_TOKEN_TIMEOUT_MS)
 
     let reply: string | null = null
     try {
-      reply = (await latestSend?.(transcript)) ?? null
+      // The bound session, passed explicitly. Left to its own render-old closure,
+      // the send can miss the session openMarker just created and mint a SECOND
+      // one — which flips the active chat, trips useVoiceGuards' switch rule, and
+      // hangs up the call while the reply streams on into a chat the user is no
+      // longer looking at. It is also what keeps interrupt()'s abortSession aimed
+      // at the same id trackRequest registered.
+      reply =
+        (await latestSend?.(transcript, {
+          sessionId: boundSessionId ?? undefined,
+          onChunk: disarmFirstToken,
+        })) ?? null
     } finally {
-      window.clearTimeout(replyTimer)
-      replyTimer = undefined
+      disarmFirstToken()
     }
 
     // Interrupted, timed out, hung up, or the send failed (the error is already
@@ -440,6 +505,7 @@ export function useVoiceCall() {
         // Late events from an interrupted turn must not drive the new caption.
         if (current()) setSpokenCharIndex(charIndex)
       })
+      ttsFailures = 0 // it spoke; whatever went wrong before is not a pattern
     } catch (err) {
       if (!current()) return
       // A muted assistant blocks every following turn the same way: end and say why.
@@ -447,7 +513,18 @@ export function useVoiceCall() {
         failCall(err)
         return
       }
-      // TTS failed — the reply text is already in the chat; the run stays alive.
+      // The reply text is already in the chat, so the run CAN go on — but silently
+      // is the wrong way to do it. A turn that answered in writing when the user
+      // asked out loud has failed at the one thing they wanted, and saying nothing
+      // leaves them staring at a mute assistant with no idea why.
+      ttsFailures++
+      if (ttsFailures >= MAX_CONSECUTIVE_TTS_FAILURES) {
+        // Twice in a row is a broken key or voice id, not a blip. Every remaining
+        // turn would be silent too; end the call rather than let them talk into it.
+        failCall(err)
+        return
+      }
+      setError(toFriendlyVoiceMessage(err))
     } finally {
       if (current()) settleTurn()
     }
@@ -486,6 +563,7 @@ export function useVoiceCall() {
     markerId = null
     callStartedAtMs = null
     lastFinalText = ''
+    ttsFailures = 0
     queue = Promise.resolve()
     // A chat is already open: bind now, so switching away from it ends voice.
     // Null (home screen) stays unbound until the first utterance creates one.
@@ -524,19 +602,41 @@ export function useVoiceCall() {
         onInterim: (text) => {
           if (!callActive) return
           const said = text.trim()
-          // A transcriber may re-emit the just-committed utterance as a partial;
-          // acting on it would abort every reply the moment it began.
           if (!said || said === lastFinalText) return
-          // Words while a turn is in flight = user talking over the assistant.
-          // Not its own voice: the mic is gated shut while it actually speaks.
-          if (processingTurn) bargeIn()
+          // A partial NEVER interrupts. It used to, and that was the bug: the mic
+          // is wide open through the whole 'thinking' phase, so the cough, the
+          // keystroke, the tail of the user's own sentence still coming up the
+          // socket — every one of them arrived here as a partial and killed the
+          // reply being generated. What made it silent rather than obviously
+          // broken is that the reply text lands in the chat regardless, so it just
+          // looked like the assistant had answered in writing.
+          //
+          // A partial is not evidence of speech. It is evidence of sound. Only a
+          // COMMITTED utterance is evidence of speech, and that is onFinal's job.
+          if (processingTurn) return
+
           // Someone is mid-sentence — a long question must not trip the silence
           // timer.
           armSilence(() => failCall(new VoiceServiceError('no_speech')))
           setLiveTranscript(text)
         },
         onFinal: (text) => {
+          if (!callActive) return
+          // An echo of the utterance that STARTED the turn now in flight is not a
+          // new one — and since a final now interrupts, letting it through would
+          // abort the very turn it asked for. Scoped to `processingTurn` on purpose:
+          // once that turn is done, saying "yes" a second time is a real second
+          // "yes", and must not be swallowed as a duplicate.
+          if (processingTurn && text === lastFinalText) return
           lastFinalText = text
+          // A finished utterance while a turn is in flight IS the barge-in — the
+          // transcriber's VAD has confirmed a whole thing was said, which no amount
+          // of room noise can fake. Interrupting HERE, rather than on a partial,
+          // also means the interruption always comes with its replacement: the old
+          // turn is never thrown away in the hope that a final follows it.
+          if (processingTurn) bargeIn()
+          // Unconditional. enqueueTurn chains on `queue`, so the aborted turn fully
+          // unwinds — releasing its inFlight slot — before this one starts.
           enqueueTurn(text)
         },
         onBargeIn: () => bargeIn(),

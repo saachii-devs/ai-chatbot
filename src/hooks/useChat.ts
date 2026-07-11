@@ -68,25 +68,43 @@ export function useChat() {
   const activeError = activeSessionId ? (state.errors[activeSessionId] ?? null) : null
 
   // Resolves with the complete reply text (or text so far if stopped), null on
-  // failure/no-op. priorOverride is for retry: `state` here is a render-old
-  // closure blind to a just-dispatched rewind, so retry passes the history explicitly.
+  // failure/no-op.
+  //
+  // Every option here exists because `state` is a render-old closure, and a caller
+  // may know something it cannot see yet:
+  //  - `sessionId`: send into THIS chat, whatever the closure thinks is active.
+  //    Voice passes the session it bound to; without it, a closure that predates
+  //    the session's own SESSION_CREATED would mint a second one and strand the
+  //    reply in a chat nobody is looking at.
+  //  - `priorMessages`: retry's history, blind to a just-dispatched rewind.
+  //  - `onChunk`: fired per token, so a caller can time the FIRST one rather than
+  //    the whole stream (voice's reply watchdog — see useVoiceCall).
   async function sendMessage(
     text: string,
-    priorOverride?: Message[],
+    opts?: {
+      sessionId?: string
+      priorMessages?: Message[]
+      onChunk?: (chunk: string) => void
+    },
   ): Promise<string | null> {
     const trimmed = text.trim()
     if (!trimmed) return null
 
     // Synchronous through `trackRequest` so a second same-tick call sees these guards.
-    let sessionId = state.activeSessionId
+    let sessionId = opts?.sessionId ?? state.activeSessionId
     const active = state.sessions.find((s) => s.id === sessionId)
     if (sessionId && isInFlight(sessionId)) return null
     if (!sessionId && creatingSession) return null
 
     // Lazy session creation: sending from HomeView makes the chat exist.
-    let priorMessages: Message[] = priorOverride ?? active?.messages ?? []
+    //
+    // An explicit sessionId is TRUSTED — it is not checked against `active`. The
+    // caller that passed it created that session moments ago, so a render-old
+    // `state.sessions` may not list it yet; creating another because we cannot
+    // see it is the very bug the parameter exists to prevent.
+    let priorMessages: Message[] = opts?.priorMessages ?? active?.messages ?? []
     let created = false
-    if (!sessionId || !active) {
+    if (!sessionId || (!active && !opts?.sessionId)) {
       const session: ChatSession = {
         id: uuid(),
         title: 'New chat',
@@ -134,6 +152,7 @@ export function useChat() {
           break
         }
         reply += next.value
+        opts?.onChunk?.(next.value)
         dispatch({
           type: 'REPLY_CHUNK',
           sessionId,
@@ -194,7 +213,10 @@ export function useChat() {
     // answer in history would show the model its own stump.
     dispatch({ type: 'MESSAGES_REWOUND', sessionId: active.id, messageId: failed.id })
     dispatch({ type: 'ERROR_DISMISSED', sessionId: active.id })
-    void sendMessage(failed.content, active.messages.slice(0, cut))
+    void sendMessage(failed.content, {
+      sessionId: active.id,
+      priorMessages: active.messages.slice(0, cut),
+    })
   }
 
   function dismissError(): void {
